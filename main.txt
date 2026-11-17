@@ -1,0 +1,2091 @@
+-- Veils startup wrapper: UI mounting and visible initialization diagnostics.
+local startupStage='entry'
+local startupEnvironment=_G
+if type(getgenv)=='function' then
+    local ok,value=pcall(getgenv)
+    if ok and type(value)=='table' then startupEnvironment=value end
+end
+local startupOverlay
+local function mountVeilsGui(root)
+    local candidates={}
+    if type(gethui)=='function' then
+        local ok,parent=pcall(gethui)
+        if ok and typeof(parent)=='Instance' then table.insert(candidates,parent) end
+    end
+    local ok,core=pcall(function() return game:GetService('CoreGui') end)
+    if ok then table.insert(candidates,core) end
+    local player=game:GetService('Players').LocalPlayer
+    if player then
+        local playerGui=player:FindFirstChildOfClass('PlayerGui') or player:WaitForChild('PlayerGui',10)
+        if playerGui then table.insert(candidates,playerGui) end
+    end
+    for _,parent in ipairs(candidates) do
+        local mounted=pcall(function() root.Parent=parent end)
+        if mounted and root.Parent==parent then return end
+    end
+    error('No usable UI parent was found; run after joining an experience')
+end
+local function showStartupStatus(message,failed)
+    if not startupOverlay then
+        startupOverlay=Instance.new('ScreenGui')
+        startupOverlay.Name='VeilsStartupStatus'
+        startupOverlay.ResetOnSpawn=false
+        startupOverlay.IgnoreGuiInset=true
+        startupOverlay.DisplayOrder=10000
+        mountVeilsGui(startupOverlay)
+        for _,child in ipairs(startupOverlay.Parent:GetChildren()) do
+            if child~=startupOverlay and child.Name=='VeilsStartupStatus' and child:IsA('ScreenGui') then child:Destroy() end
+        end
+        local label=Instance.new('TextLabel')
+        label.Name='Status'
+        label.Position=UDim2.fromOffset(16,50)
+        label.Size=UDim2.new(0,math.min(560,math.max(260,(workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize.X or 600)-32)),0,110)
+        label.BackgroundColor3=Color3.fromRGB(22,22,25)
+        label.TextColor3=Color3.fromRGB(240,240,244)
+        label.TextSize=14
+        label.Font=Enum.Font.Gotham
+        label.TextWrapped=true
+        label.ZIndex=100
+        label.Parent=startupOverlay
+        local corner=Instance.new('UICorner'); corner.CornerRadius=UDim.new(0,12); corner.Parent=label
+    end
+    startupOverlay.Status.Text=message
+    startupOverlay.Status.TextColor3=failed and Color3.fromRGB(255,130,140) or Color3.fromRGB(240,240,244)
+end
+local function bootVeils()
+startupStage='waiting for client'
+local deadline=os.clock()+10
+while not game:GetService('Players').LocalPlayer and os.clock()<deadline do task.wait(.1) end
+pcall(showStartupStatus,'Veils Universe: building menu...',false)
+
+-- Veils Universe | standalone client UI, no remote code or Drawing dependency.
+-- Recreates the supplied C++ UI style using native Roblox GUI objects.
+local Players = game:GetService('Players')
+local Run = game:GetService('RunService')
+local Input = game:GetService('UserInputService')
+local Http = game:GetService('HttpService')
+local Lighting = game:GetService('Lighting')
+local LP = Players.LocalPlayer
+assert(LP, 'Run on a Roblox client')
+local env = startupEnvironment
+-- Unload the previous branded build when updating in the same session.
+if type(env.ZeninUniversal)=='table' and type(env.ZeninUniversal.Unload)=='function' then pcall(env.ZeninUniversal.Unload) end
+if type(env.VeilsUniverse)=='table' and type(env.VeilsUniverse.Unload)=='function' then pcall(env.VeilsUniverse.Unload) end
+startupStage='building GUI'
+local S = {
+    RevolverAutoFire=false, RevolverAutoFireV2=false, RevolverFireInterval=0,
+    Aim=false, AimKey='MouseButton2', AimMode='Hold', Part='Head', FOV=150,
+    ShowFOV=false, Smooth=0, Prediction=0.01, Shake=0, TeamCheck=false, WallCheck=false,
+    ESP=false, Box=true, Fill=false, Box3D=false, Names=true, Skeleton=false,
+    Tracers=false, Snaplines=false, HealthBar=false, Distance=false,
+    HealthColor='#4ADE80', DistanceColor='#FFFFFF', MaxDistance=2500, FillOpacity=0.15,
+    FlyAnimationID='73602135057541', HoverAnimationID='131145074585836',
+    Fly=false, FlyKey='F', FlySpeed=60, InfiniteJump=false, JumpOverride=false, JumpHeight=12,
+    Desync=false, DesyncKey='V', DesyncColor='#A78BFA', DesyncMarker=true, DesyncTrail=true,
+    TargetIndicator=true, HotkeyOverlay=true, Profile='Default', StandAutoReplace=true, StandAutoResume=true,
+    Fullbright=false, NoFog=false, ClockOverride=false, WorldTime=12,
+    CameraOverride=false, CameraFOV=80, ZoomOverride=false, MaxZoom=400,
+    Noclip=false, Speed=false, WalkSpeed=32,
+    UIKey='RightShift', Accent='#FF72B6', FOVColor='#FF2E3E',
+    BoxColor='#FFFFFF', FillColor='#FF2E3E', Box3DColor='#FFFFFF',
+    NameColor='#FFFFFF', SkeletonColor='#FFFFFF', TracerColor='#FF2E3E', SnapColor='#FFFFFF',
+}
+local alive, held, latched, locked, binding = true, false, false, nil, nil
+local validInputs={}
+for _,v in ipairs(Enum.KeyCode:GetEnumItems()) do validInputs[v.Name]=true end
+for _,name in ipairs({'MouseButton1','MouseButton2','MouseButton3'}) do validInputs[name]=true end
+local connections, themed, refreshers, records = {}, {}, {}, {}
+local collision = setmetatable({}, {__mode='k'})
+local speeds = setmetatable({}, {__mode='k'})
+local jumps = setmetatable({}, {__mode='k'})
+local flight, flightAttachment, flightOrientation, flightHumanoid, oldAutoRotate, oldPlatform
+local clientFocused=true
+local lastFlightHeading=Vector3.new(0,0,-1)
+local stopFlightAnimation
+local fling, selected
+local desync
+local followState
+local followCommands={}
+local standWhitelist={}
+local paletteOpen=false
+local openCommandPalette,updateCommandPalette
+local function connect(signal, fn)
+    local c=signal:Connect(fn); table.insert(connections,c); return c
+end
+local function color(hex)
+    local ok,c=pcall(Color3.fromHex,hex); return ok and c or Color3.new(1,1,1)
+end
+local function make(class, props, parent)
+    local x=Instance.new(class)
+    if x:IsA('GuiObject') then x.BorderSizePixel=0 end
+    for k,v in pairs(props or {}) do
+        local ok,err=pcall(function() x[k]=v end)
+        if not ok then x:Destroy(); error(class..'.'..k..': '..tostring(err),2) end
+    end
+    x.Parent=parent; return x
+end
+local function round(x,r) make('UICorner',{CornerRadius=UDim.new(0,r or 10)},x) end
+local function accent(x,p)
+    table.insert(themed,{x,p}); x[p]=color(S.Accent)
+end
+local gui=make('ScreenGui',{Name='VeilsUniverse',ResetOnSpawn=false,IgnoreGuiInset=true,
+    ZIndexBehavior=Enum.ZIndexBehavior.Sibling,DisplayOrder=200},nil)
+mountVeilsGui(gui)
+for _,child in ipairs(gui.Parent:GetChildren()) do
+    if child~=gui and (child.Name=='VeilsUniverse' or child.Name=='ZeninUniversal') and child:IsA('ScreenGui') then child:Destroy() end
+end
+local worldVisuals=make('Folder',{Name='VeilsLocalVisuals'},workspace)
+-- Register early cleanup, including partially initialized menus.
+env.VeilsUniverse={Unload=function()
+    alive=false; for _,c in ipairs(connections) do c:Disconnect() end
+    gui:Destroy(); if worldVisuals then worldVisuals:Destroy() end; env.VeilsUniverse=nil
+end}
+local overlay=make('Frame',{Size=UDim2.fromScale(1,1),BackgroundTransparency=1},gui)
+local ring=make('Frame',{AnchorPoint=Vector2.new(.5,.5),BackgroundTransparency=1,Visible=S.ShowFOV},overlay)
+round(ring,999)
+local ringStroke=make('UIStroke',{Thickness=1.5,Color=color(S.FOVColor)},ring)
+local Tween = game:GetService('TweenService')
+local C={win=Color3.fromRGB(13,13,18),card=Color3.fromRGB(19,19,25),
+    inset=Color3.fromRGB(12,12,18),stroke=Color3.fromRGB(39,39,50),
+    text=Color3.fromRGB(244,244,247),label=Color3.fromRGB(155,155,173),
+    muted=Color3.fromRGB(108,108,126),icon=Color3.fromRGB(20,20,24)}
+local function animate(x,p)
+    Tween:Create(x,TweenInfo.new(.18,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),p):Play()
+end
+local function stroke(x,c,t) return make('UIStroke',{Color=c or C.stroke,Thickness=t or 1,ApplyStrokeMode=Enum.ApplyStrokeMode.Border},x) end
+local window=make('Frame',{Size=UDim2.fromOffset(980,620),AnchorPoint=Vector2.new(.5,.5),Position=UDim2.fromScale(.5,.5),
+    BackgroundColor3=C.win,ClipsDescendants=true,Active=true,ZIndex=10},gui)
+round(window,16); stroke(window,Color3.fromRGB(65,65,69))
+local scale=make('UIScale',{},window)
+local updateMenuSnow
+do
+    local layer=make('Frame',{Name='AccentSnow',Size=UDim2.fromScale(1,1),BackgroundTransparency=1,
+        ClipsDescendants=true,Active=false,ZIndex=40},window)
+    local random=Random.new()
+    local flakes={}
+    local elapsed,lastColor=0,nil
+    for i=1,32 do
+        local diameter=random:NextNumber(2,4)
+        local dot=make('Frame',{Name='Flake',Size=UDim2.fromOffset(diameter,diameter),
+            BackgroundColor3=color(S.Accent),BackgroundTransparency=random:NextNumber(.48,.78),
+            BorderSizePixel=0,Active=false,ZIndex=41},layer); round(dot,99)
+        flakes[i]={dot=dot,x=random:NextNumber(0,980),y=random:NextNumber(-12,620),
+            speed=random:NextNumber(17,38),sway=random:NextNumber(3,11),phase=random:NextNumber(0,math.pi*2)}
+    end
+    updateMenuSnow=function(dt)
+        layer.Visible=window.Visible
+        if not window.Visible then return end
+        dt=math.clamp(dt,0,.05); elapsed=elapsed+dt
+        if lastColor~=S.Accent then
+            lastColor=S.Accent
+            for _,flake in ipairs(flakes) do flake.dot.BackgroundColor3=color(S.Accent) end
+        end
+        for _,flake in ipairs(flakes) do
+            flake.y=flake.y+flake.speed*dt
+            if flake.y>628 then flake.y=-8; flake.x=random:NextNumber(0,980) end
+            local x=flake.x+math.sin(elapsed*.7+flake.phase)*flake.sway
+            flake.dot.Position=UDim2.fromOffset(x,flake.y)
+        end
+    end
+end
+local function text(parent,t,pos,size)
+    return make('TextLabel',{Text=t,Position=pos,Size=size,BackgroundTransparency=1,
+        Font=Enum.Font.GothamMedium,TextSize=13,TextColor3=C.label,
+        TextXAlignment=Enum.TextXAlignment.Left,ZIndex=12},parent)
+end
+local function button(parent,t,pos,size,fn)
+    local b=make('TextButton',{Text=t,Position=pos,Size=size,AutoButtonColor=false,
+        BackgroundColor3=C.inset,TextColor3=C.text,TextSize=12,Font=Enum.Font.Gotham,ZIndex=13},parent)
+    round(b,7); stroke(b)
+    connect(b.Activated,fn)
+    connect(b.MouseEnter,function() animate(b,{BackgroundColor3=Color3.fromRGB(27,27,31)}) end)
+    connect(b.MouseLeave,function() animate(b,{BackgroundColor3=C.inset}) end)
+    return b
+end
+local function segment(parent,x1,y1,x2,y2,col,width,z)
+    local a,b=Vector2.new(x1,y1),Vector2.new(x2,y2); local d=b-a
+    return make('Frame',{AnchorPoint=Vector2.new(.5,.5),Position=UDim2.fromOffset((x1+x2)/2,(y1+y2)/2),
+        Size=UDim2.fromOffset(d.Magnitude,width or 1.5),Rotation=math.deg(math.atan2(d.Y,d.X)),
+        BorderSizePixel=0,BackgroundColor3=col,ZIndex=z or 15},parent)
+end
+local function icon(parent,kind,x,y,col)
+    local host=make('Frame',{Position=UDim2.fromOffset(x,y),Size=UDim2.fromOffset(18,18),BackgroundTransparency=1,ZIndex=15},parent)
+    local pieces={}
+    local function l(a,b,c,d) table.insert(pieces,segment(host,a,b,c,d,col,1.5,15)) end
+    local function circle(px,py,size)
+        local f=make('Frame',{Position=UDim2.fromOffset(px,py),Size=UDim2.fromOffset(size,size),BackgroundTransparency=1,ZIndex=15},host)
+        round(f,99); table.insert(pieces,stroke(f,col,1.5))
+    end
+    if kind=='Aimbot' or kind=='target' then circle(4,4,10); l(9,0,9,5); l(9,13,9,18); l(0,9,5,9); l(13,9,18,9)
+    elseif kind=='ESP' then l(1,9,5,4); l(5,4,13,4); l(13,4,17,9); l(17,9,13,14); l(13,14,5,14); l(5,14,1,9); circle(6,6,6)
+    elseif kind=='Misc' then l(2,5,9,1); l(9,1,16,5); l(16,5,16,13); l(16,13,9,17); l(9,17,2,13); l(2,13,2,5); l(2,5,9,9); l(9,9,16,5); l(9,9,9,17)
+    elseif kind=='World' then circle(1,1,16); l(1,9,17,9); l(9,1,9,17); l(5,3,3,9); l(3,9,5,15); l(13,3,15,9); l(15,9,13,15)
+    elseif kind=='copy' then l(3,3,12,3); l(3,3,3,12); l(6,6,15,6); l(15,6,15,16); l(15,16,6,16); l(6,16,6,6)
+    else circle(3,3,12); circle(7,7,4); for i=0,7 do local a=i*math.pi/4; l(9+math.cos(a)*6,9+math.sin(a)*6,9+math.cos(a)*8,9+math.sin(a)*8) end end
+    return function(c) for _,p in ipairs(pieces) do if p:IsA('UIStroke') then p.Color=c else p.BackgroundColor3=c end end end
+end
+-- Sidebar layout inspired by the supplied references; the feature controllers are unchanged.
+local sidebar=make('Frame',{Size=UDim2.fromOffset(184,620),BackgroundColor3=Color3.fromRGB(11,11,16),ZIndex=11},window)
+make('Frame',{Position=UDim2.fromOffset(183,0),Size=UDim2.fromOffset(1,620),BackgroundColor3=C.stroke,BorderSizePixel=0,ZIndex=12},window)
+local brand=text(sidebar,'VEILS',UDim2.fromOffset(20,25),UDim2.fromOffset(144,36))
+brand.Font=Enum.Font.GothamBold; brand.TextSize=30; brand.TextColor3=C.text
+local brandSub=text(sidebar,'UNIVERSE',UDim2.fromOffset(21,61),UDim2.fromOffset(143,25))
+brandSub.Font=Enum.Font.GothamBold; brandSub.TextSize=18; accent(brandSub,'TextColor3')
+local title=make('TextLabel',{Text='Aimbot',Font=Enum.Font.GothamBold,TextSize=20,
+    TextXAlignment=Enum.TextXAlignment.Left,Size=UDim2.fromOffset(500,34),Position=UDim2.fromOffset(200,20),
+    BackgroundTransparency=1,TextColor3=C.text,Active=true,ZIndex=12},window)
+local closeButton=button(window,'x',UDim2.fromOffset(936,20),UDim2.fromOffset(28,28),function() window.Visible=false end)
+closeButton.TextSize=14
+local footer=text(window,'VEILS UNIVERSE',UDim2.fromOffset(200,592),UDim2.fromOffset(500,16)); footer.TextSize=9; footer.TextColor3=C.muted
+local menuHint=text(window,'RSHIFT  TO HIDE',UDim2.fromOffset(780,592),UDim2.fromOffset(180,16)); menuHint.TextSize=9; menuHint.TextXAlignment=Enum.TextXAlignment.Right
+local toast=make('TextLabel',{AnchorPoint=Vector2.new(.5,1),Position=UDim2.new(.5,0,1,-18),
+    Size=UDim2.fromOffset(510,34),BackgroundColor3=C.card,TextColor3=C.text,TextSize=12,
+    Font=Enum.Font.Gotham,Visible=false,ZIndex=90},gui); round(toast,10); stroke(toast)
+local noticeSerial=0
+local function notify(t)
+    noticeSerial=noticeSerial+1; local n=noticeSerial; toast.Text=t; toast.Visible=true
+    task.delay(4,function() if alive and n==noticeSerial then toast.Visible=false end end)
+end
+make('Frame',{Position=UDim2.fromOffset(200,66),Size=UDim2.fromOffset(768,1),BackgroundColor3=C.stroke,ZIndex=12},window)
+local pages,tabs,columns,groups={},{},{},{}
+local currentPage='Aimbot'
+local popup
+local function closePopup() if popup then popup:Destroy(); popup=nil end end
+local function setPage(name)
+    closePopup(); currentPage=name; title.Text=name
+    for n,p in pairs(pages) do p.Visible=n==name end
+    for n,t in pairs(tabs) do
+        local selected=n==name
+        t.bg.BackgroundTransparency=selected and 0 or 1; t.marker.Visible=selected
+        t.label.TextColor3=selected and C.text or C.label
+        t.tint(selected and color(S.Accent) or C.muted)
+    end
+    local p=pages[name]; p.Position=UDim2.fromOffset(210,78)
+    animate(p,{Position=UDim2.fromOffset(200,78)})
+end
+local quickSettings=button(window,'',UDim2.fromOffset(900,20),UDim2.fromOffset(28,28),function() setPage('Settings') end)
+icon(quickSettings,'Settings',5,5,C.label)
+for _,name in ipairs({'Aimbot','ESP','Misc','World','Settings'}) do
+    local p=make('ScrollingFrame',{Position=UDim2.fromOffset(200,78),Size=UDim2.fromOffset(768,510),
+        BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=3,ScrollBarImageColor3=C.stroke,
+        CanvasSize=UDim2.new(),Visible=name=='Aimbot',ZIndex=11},window)
+    pages[name]=p; columns[name]={}
+    for i=1,2 do
+        local col=make('Frame',{Position=UDim2.fromOffset((i-1)*388,0),Size=UDim2.fromOffset(376,0),
+            AutomaticSize=Enum.AutomaticSize.Y,BackgroundTransparency=1,ZIndex=11},p)
+        make('UIListLayout',{Padding=UDim.new(0,12),SortOrder=Enum.SortOrder.LayoutOrder},col)
+        columns[name][i]=col
+    end
+
+end
+for _,section in ipairs({{'COMBAT',110},{'GENERAL',178},{'UTILITY',342}}) do
+    local label=text(sidebar,section[1],UDim2.fromOffset(20,section[2]),UDim2.fromOffset(144,16)); label.TextSize=9; label.TextColor3=C.muted
+end
+for _,entry in ipairs({{'Aimbot',132,'Aimbot'},{'ESP',202,'Visuals'},{'Misc',246,'Movement'},{'World',290,'World'},{'Settings',366,'Settings'}}) do
+    local name,y,label=entry[1],entry[2],entry[3]
+    local hit=make('TextButton',{Text='',Position=UDim2.fromOffset(12,y),Size=UDim2.fromOffset(160,38),
+        BackgroundTransparency=1,ZIndex=21},sidebar)
+    local bg=make('Frame',{Size=UDim2.fromScale(1,1),BackgroundColor3=Color3.fromRGB(20,20,23),
+        BackgroundTransparency=name=='Aimbot' and 0 or 1,ZIndex=20},hit); round(bg,8)
+    local marker=make('Frame',{Position=UDim2.fromOffset(0,10),Size=UDim2.fromOffset(3,20),
+        BackgroundColor3=color(S.Accent),Visible=name=='Aimbot',ZIndex=22},bg); round(marker,2); accent(marker,'BackgroundColor3')
+    local tint=icon(bg,name,13,11,name=='Aimbot' and color(S.Accent) or C.muted)
+    local caption=text(bg,label,UDim2.fromOffset(43,0),UDim2.fromOffset(116,38)); caption.TextSize=13; caption.ZIndex=21
+    caption.TextColor3=name=='Aimbot' and C.text or C.label
+    tabs[name]={bg=bg,label=caption,tint=tint,marker=marker}; connect(hit.Activated,function() setPage(name) end)
+    connect(hit.MouseEnter,function() if currentPage~=name then animate(bg,{BackgroundTransparency=.45}) end end)
+    connect(hit.MouseLeave,function() if currentPage~=name then animate(bg,{BackgroundTransparency=1}) end end)
+end
+
+
+
+local routing={
+    RevolverAutoFire={'Weapon Auto-Fire',1},RevolverAutoFireV2={'Weapon Auto-Fire',1},RevolverFireInterval={'Weapon Auto-Fire',1},
+    Aim={'Enable',1},AimKey={'Enable',1},AimMode={'Enable',1},
+    Part={'Aiming',1},Smooth={'Aiming',1},Prediction={'Aiming',1},Shake={'Aiming',1},
+    TeamCheck={'Checks',2},WallCheck={'Checks',2},FOV={'Field of View',2},ShowFOV={'Field of View',2},FOVColor={'Field of View',2},
+    ESP={'Enable',1},Box={'Boxes',1},Fill={'Boxes',1},Box3D={'Boxes',1},BoxColor={'Boxes',1},FillColor={'Boxes',1},Box3DColor={'Boxes',1},FillOpacity={'Boxes',1},
+    Names={'Information',2},NameColor={'Information',2},Skeleton={'Information',2},SkeletonColor={'Information',2},MaxDistance={'Information',2},
+    HealthBar={'Information',2},HealthColor={'Information',2},Distance={'Information',2},DistanceColor={'Information',2},
+    Tracers={'Lines',2},TracerColor={'Lines',2},Snaplines={'Lines',2},SnapColor={'Lines',2},
+    Fly={'Movement',1},FlyKey={'Movement',1},FlySpeed={'Movement',1},Noclip={'Movement',1},Speed={'Movement',1},WalkSpeed={'Movement',1},
+    InfiniteJump={'Movement',1},JumpOverride={'Movement',1},JumpHeight={'Movement',1},
+    Desync={'Desync',2},DesyncKey={'Desync',2},DesyncColor={'Desync',2},
+    Fullbright={'Lighting',1},NoFog={'Lighting',1},ClockOverride={'Time',1},WorldTime={'Time',1},
+    CameraOverride={'Camera',2},CameraFOV={'Camera',2},ZoomOverride={'Zoom',2},MaxZoom={'Zoom',2},
+    DesyncMarker={'Desync',2},DesyncTrail={'Desync',2},TargetIndicator={'Checks',2},HotkeyOverlay={'Appearance',1},Profile={'Profiles',2},Unload={'Session',1},FlyAnimationID={'Flight Animations',2},HoverAnimationID={'Flight Animations',2},
+    Accent={'Appearance',1},UIKey={'Keybinds',1},
+}
+local function card(page,name,col)
+    local id=page..'/'..name
+    if groups[id] then return groups[id] end
+    local f=make('Frame',{Size=UDim2.fromOffset(376,52),BackgroundColor3=C.card,ZIndex=11},columns[page][col]); round(f,10); stroke(f)
+    local heading=text(f,name,UDim2.fromOffset(16,7),UDim2.fromOffset(344,34))
+    heading.Font=Enum.Font.GothamBold; heading.TextSize=14; heading.TextColor3=C.text; heading.Text=name
+    local g={frame=f,y=46,name=name,page=page}; groups[id]=g; return g
+end
+-- Fix card order before controls are added, matching the supplied two-column composition.
+card('Aimbot','Enable',1); card('Aimbot','Aiming',1); card('Aimbot','Checks',2); card('Aimbot','Field of View',2)
+card('ESP','Enable',1); card('ESP','Boxes',1); card('ESP','Information',2); card('ESP','Lines',2)
+card('Misc','Movement',1); card('Misc','Target',2)
+card('World','Lighting',1); card('World','Time',1); card('World','Camera',2); card('World','Zoom',2)
+card('Settings','Appearance',1); card('Settings','Keybinds',1); card('Settings','Session',1); card('Settings','Profiles',2); card('Settings','Flight Animations',2); card('Settings','Credits',2)
+local function row(page,label,key,height,header)
+    local route=key and routing[key]
+    local name,col
+    if route then name,col=route[1],route[2]
+    elseif page=='Misc' then name,col='Target',2
+    elseif page=='World' then name,col='Camera',2
+    elseif page=='Settings' then name,col=(label:find('Credits') or label:find('remote')) and 'Credits' or 'Profiles',2
+    else name,col='Other',2 end
+    local g=card(page,name,col)
+    local isHeader=header and (key=='Aim' or key=='ESP')
+    local y=isHeader and 4 or g.y
+    local r=make('Frame',{Position=UDim2.fromOffset(0,y),Size=UDim2.fromOffset(376,height or 44),BackgroundTransparency=1,ZIndex=12},g.frame)
+    if not isHeader then
+        local caption=text(r,label,UDim2.fromOffset(16,0),UDim2.fromOffset(200,height or 44)); caption.TextSize=13
+        if page=='Settings' and name=='Credits' then caption.Size=UDim2.fromOffset(344,44); caption.TextSize=13; caption.TextWrapped=true end
+        g.y=g.y+(height or 44)
+    end
+    g.frame.Size=UDim2.fromOffset(376,math.max(g.y+10,52))
+    return r
+end
+local function refresh()
+    for _,v in ipairs(themed) do if v[1].Parent then v[1][v[2]]=color(S.Accent) end end
+    for _,fn in ipairs(refreshers) do fn() end
+    for n,t in pairs(tabs) do t.tint(n==currentPage and color(S.Accent) or C.muted) end
+    menuHint.Text=S.UIKey..'  TO HIDE'
+end
+local targetHighlight=make('Highlight',{Name='VeilsLockedTarget',Enabled=false,
+    FillTransparency=1,OutlineTransparency=.05,OutlineColor=color(S.Accent),
+    DepthMode=Enum.HighlightDepthMode.AlwaysOnTop},worldVisuals)
+local hotkeyPanel=make('Frame',{AnchorPoint=Vector2.new(1,0),Position=UDim2.new(1,-16,0,70),
+    Size=UDim2.fromOffset(168,44),BackgroundColor3=C.card,BackgroundTransparency=.12,ZIndex=50},gui)
+round(hotkeyPanel,10); stroke(hotkeyPanel)
+local hotkeyTitle=text(hotkeyPanel,'KEYBINDS',UDim2.fromOffset(10,3),UDim2.fromOffset(148,18)); hotkeyTitle.TextSize=10; hotkeyTitle.ZIndex=51
+local hotkeyText=text(hotkeyPanel,'',UDim2.fromOffset(10,23),UDim2.fromOffset(148,16)); hotkeyText.TextSize=11; hotkeyText.ZIndex=51; hotkeyText.TextYAlignment=Enum.TextYAlignment.Top
+local updateStandStatus
+do
+    local panel=make('Frame',{Name='StandStatus',AnchorPoint=Vector2.new(1,0),
+        Position=UDim2.new(1,-16,0,130),Size=UDim2.fromOffset(236,106),
+        BackgroundColor3=C.card,BackgroundTransparency=.08,Visible=false,ZIndex=50},gui)
+    round(panel,10); stroke(panel)
+    local marker=make('Frame',{Position=UDim2.fromOffset(12,13),Size=UDim2.fromOffset(3,13),ZIndex=51},panel)
+    round(marker,2); accent(marker,'BackgroundColor3')
+    local statusTitle=text(panel,'STAND',UDim2.fromOffset(23,8),UDim2.fromOffset(200,22))
+    statusTitle.TextSize=11; statusTitle.ZIndex=51
+    local detail=text(panel,'',UDim2.fromOffset(12,35),UDim2.fromOffset(212,63))
+    detail.TextSize=11; detail.TextYAlignment=Enum.TextYAlignment.Top
+    detail.TextTruncate=Enum.TextTruncate.AtEnd; detail.ZIndex=51
+    updateStandStatus=function()
+        local state=followState
+        panel.Visible=state~=nil
+        if not state then return end
+        local offset=S.HotkeyOverlay and hotkeyPanel.AbsoluteSize.Y+12 or 0
+        panel.Position=UDim2.new(1,-16,0,70+offset)
+        local mode=state.waitingRespawn and 'WAITING FOR RESPAWN'
+            or state.mode=='underground' and 'ENTERING'
+            or state.mode=='orbit' and 'ORBITING' or 'FOLLOWING'
+        statusTitle.Text='STAND  /  '..mode
+        local controller=state.controllerUserId and Players:GetPlayerByUserId(state.controllerUserId)
+        local owner=state.controllerUserId and (controller and '@'..controller.Name or 'Disconnected') or 'You'
+        local value='Following  @'..state.target.Name..'\nControlled by  '..owner..'\nRelease  .unstand'
+        if detail.Text~=value then detail.Text=value end
+    end
+end
+local function shortKey(key)
+    return ({MouseButton1='LMB',MouseButton2='RMB',MouseButton3='MMB',RightShift='RShift',LeftShift='LShift'})[key] or key
+end
+local function updateCompactOverlays()
+    updateStandStatus()
+    local character=locked and locked.Character
+    targetHighlight.Adornee=character
+    targetHighlight.Enabled=S.TargetIndicator and S.Aim and (held or latched) and character~=nil
+    targetHighlight.OutlineColor=color(S.Accent)
+    hotkeyPanel.Visible=S.HotkeyOverlay
+    if not S.HotkeyOverlay then return end
+    local lines={}
+    if S.Aim and (held or latched) then table.insert(lines,'Aimlock  ['..shortKey(S.AimKey)..']') end
+    if S.Fly then table.insert(lines,'Fly  ['..shortKey(S.FlyKey)..']') end
+    if S.Desync then table.insert(lines,'Desync  ['..shortKey(S.DesyncKey)..']') end
+    if #lines==0 then lines[1]='No active binds' end
+    hotkeyTitle.Text='KEYBINDS  |  '..shortKey(S.UIKey)
+    local value=table.concat(lines,'\n')
+    if hotkeyText.Text~=value then hotkeyText.Text=value end
+    hotkeyText.Size=UDim2.fromOffset(148,#lines*16)
+    hotkeyPanel.Size=UDim2.fromOffset(168,29+#lines*16)
+end
+local function toggle(page,label,key)
+    local r=row(page,label,key,44,true)
+    local b=make('TextButton',{Text='',Position=UDim2.fromOffset(326,12),Size=UDim2.fromOffset(34,18),
+        BackgroundColor3=Color3.fromRGB(41,41,45),AutoButtonColor=false,ZIndex=14},r); round(b,99)
+    local dot=make('Frame',{Position=UDim2.fromOffset(3,3),Size=UDim2.fromOffset(12,12),BackgroundColor3=Color3.fromRGB(118,118,124),ZIndex=15},b); round(dot,99)
+    connect(b.Activated,function()
+        S[key]=not S[key]
+        if S[key] and key=='RevolverAutoFire' then S.RevolverAutoFireV2=false end
+        if S[key] and key=='RevolverAutoFireV2' then S.RevolverAutoFire=false end
+        if key=='Aim' then locked=nil; held=false; latched=false end; refresh()
+    end)
+    table.insert(refreshers,function()
+        animate(b,{BackgroundColor3=S[key] and color(S.Accent) or Color3.fromRGB(41,41,45)})
+        animate(dot,{Position=UDim2.fromOffset(S[key] and 19 or 3,3),BackgroundColor3=S[key] and Color3.new(1,1,1) or Color3.fromRGB(118,118,124)})
+    end)
+end
+local sliderDrag
+local function field(page,label,key,min,max)
+    if min then
+        local r=row(page,label,key,60)
+        local caption=r:FindFirstChildOfClass('TextLabel'); caption.Size=UDim2.fromOffset(270,30)
+        local value=make('TextBox',{Position=UDim2.fromOffset(283,0),Size=UDim2.fromOffset(77,30),
+            BackgroundTransparency=1,TextColor3=C.text,Font=Enum.Font.Gotham,TextSize=14,TextXAlignment=Enum.TextXAlignment.Right,
+            ClearTextOnFocus=false,Text=tostring(S[key]),ZIndex=14},r)
+        local track=make('TextButton',{Text='',AutoButtonColor=false,Position=UDim2.fromOffset(16,39),Size=UDim2.fromOffset(344,5),BackgroundColor3=Color3.fromRGB(41,41,45),ZIndex=14},r); round(track,99)
+        local fill=make('Frame',{Size=UDim2.fromScale(0,1),BackgroundColor3=color(S.Accent),ZIndex=15},track); round(fill,99); accent(fill,'BackgroundColor3')
+        local knob=make('Frame',{AnchorPoint=Vector2.new(.5,.5),Position=UDim2.fromScale(0,.5),Size=UDim2.fromOffset(11,11),BackgroundColor3=C.text,ZIndex=16},track); round(knob,99)
+        local hit=make('TextButton',{Text='',Position=UDim2.fromOffset(0,-9),Size=UDim2.new(1,0,0,23),BackgroundTransparency=1,ZIndex=17},track)
+        local function update(x)
+            local ratio=math.clamp((x-track.AbsolutePosition.X)/track.AbsoluteSize.X,0,1)
+            local n=min+(max-min)*ratio
+            S[key]=(max-min)>5 and math.floor(n+.5) or math.floor(n*100+.5)/100; refresh()
+        end
+        connect(hit.InputBegan,function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then sliderDrag=update; update(i.Position.X) end end)
+        connect(value.FocusLost,function() S[key]=math.clamp(tonumber(value.Text) or S[key],min,max); refresh() end)
+        table.insert(refreshers,function()
+            value.Text=string.format('%g',S[key]); local r=(S[key]-min)/(max-min)
+            fill.Size=UDim2.fromScale(r,1); knob.Position=UDim2.fromScale(r,.5)
+        end)
+    else
+        local r=row(page,label:gsub(' %(#RRGGBB%)',''),key)
+        local swatch=make('TextButton',{Text='',Position=UDim2.fromOffset(342,13),Size=UDim2.fromOffset(18,18),BackgroundColor3=color(S[key]),ZIndex=14},r); round(swatch,5)
+        connect(swatch.Activated,function()
+            closePopup()
+            popup=make('Frame',{Size=UDim2.fromOffset(260,304),Position=UDim2.new(.5,-130,.5,-152),BackgroundColor3=C.card,ZIndex=70},window); round(popup,12); stroke(popup)
+            local caption=text(popup,'Choose color',UDim2.fromOffset(14,4),UDim2.fromOffset(180,32)); caption.ZIndex=71
+            local choices={'#FF2E3E','#FF8C42','#FFD166','#4ADE80','#22D3EE','#60A5FA','#A78BFA','#F472B6','#FFFFFF','#A8A8B0','#303038','#000000'}
+            for i,hex in ipairs(choices) do
+                local b=make('TextButton',{Text='',Size=UDim2.fromOffset(30,30),Position=UDim2.fromOffset(14+((i-1)%6)*39,44+math.floor((i-1)/6)*40),BackgroundColor3=color(hex),ZIndex=72},popup); round(b,7)
+                connect(b.Activated,function() S[key]=hex; closePopup(); refresh() end)
+            end
+            local labels,fills,knobs={},{},{}
+            local function syncRGB()
+                local c=color(S[key]); local values={c.R,c.G,c.B}
+                for j=1,3 do
+                    labels[j].Text=({'R','G','B'})[j]..'  '..math.floor(values[j]*255+.5)
+                    fills[j].Size=UDim2.fromScale(values[j],1)
+                    knobs[j].Position=UDim2.fromScale(values[j],.5)
+                end
+            end
+            for channel=1,3 do
+                local y=125+(channel-1)*45
+                labels[channel]=text(popup,'',UDim2.fromOffset(14,y),UDim2.fromOffset(220,22)); labels[channel].ZIndex=72; labels[channel].TextSize=12
+                local track=make('Frame',{Position=UDim2.fromOffset(14,y+28),Size=UDim2.fromOffset(232,5),BackgroundColor3=C.stroke,ZIndex=72},popup); round(track,99)
+                fills[channel]=make('Frame',{Size=UDim2.fromScale(0,1),BackgroundColor3=({Color3.fromRGB(255,90,90),Color3.fromRGB(90,255,140),Color3.fromRGB(90,160,255)})[channel],ZIndex=73},track); round(fills[channel],99)
+                knobs[channel]=make('Frame',{Size=UDim2.fromOffset(10,10),AnchorPoint=Vector2.new(.5,.5),BackgroundColor3=C.text,ZIndex=74},track); round(knobs[channel],99)
+                local hit=make('TextButton',{Text='',Position=UDim2.fromOffset(0,-9),Size=UDim2.new(1,0,0,23),BackgroundTransparency=1,ZIndex=75},track)
+                connect(hit.InputBegan,function(i)
+                    if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+                        sliderDrag=function(x)
+                            if not track.Parent or not popup then sliderDrag=nil; return end
+                            local c=color(S[key]); local channels={c.R,c.G,c.B}
+                            channels[channel]=math.clamp((x-track.AbsolutePosition.X)/math.max(track.AbsoluteSize.X,1),0,1)
+                            S[key]='#'..Color3.new(channels[1],channels[2],channels[3]):ToHex()
+                            syncRGB(); refresh()
+                        end
+                        sliderDrag(i.Position.X)
+                    end
+                end)
+            end
+            syncRGB()
+            local close=button(popup,'Done',UDim2.fromOffset(14,268),UDim2.fromOffset(232,26),closePopup); close.ZIndex=72
+        end)
+        table.insert(refreshers,function() swatch.BackgroundColor3=color(S[key]) end)
+    end
+end
+connect(Input.InputChanged,function(i)
+    if sliderDrag and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then sliderDrag(i.Position.X) end
+end)
+connect(Input.InputEnded,function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then sliderDrag=nil end end)
+connect(Input.WindowFocusReleased,function() sliderDrag=nil end)
+local function cycle(page,label,key,options)
+    local r=row(page,label,key)
+    local b=button(r,'',UDim2.fromOffset(212,7),UDim2.fromOffset(148,30),function()
+        closePopup()
+        local abs=r.AbsolutePosition-window.AbsolutePosition; local sc=scale.Scale
+        local y=math.clamp(abs.Y/sc+38,90,600-#options*34)
+        popup=make('Frame',{Position=UDim2.fromOffset(abs.X/sc+212,y),Size=UDim2.fromOffset(148,#options*34+8),BackgroundColor3=C.inset,ZIndex=70},window); round(popup,12); stroke(popup)
+        for i,choice in ipairs(options) do
+            local opt=button(popup,choice,UDim2.fromOffset(4,4+(i-1)*34),UDim2.fromOffset(140,32),function()
+                S[key]=choice; if key=='AimMode' then held=false; latched=false; locked=nil end
+                closePopup(); refresh()
+            end); opt.ZIndex=72; opt.UIStroke:Destroy()
+        end
+    end)
+    table.insert(refreshers,function() b.Text=tostring(S[key]) end)
+end
+local function keybind(page,label,key)
+    local r=row(page,label,key)
+    local b=button(r,'',UDim2.fromOffset(252,7),UDim2.fromOffset(108,30),function() binding=key; notify('Press a key / mouse button; Esc cancels'); refresh() end)
+    b.TextSize=12
+    table.insert(refreshers,function() b.Text=binding==key and 'Press a ...' or S[key]; b.UIStroke.Color=binding==key and color(S.Accent) or C.stroke end)
+end
+-- Canvas height follows the taller column; cards scroll together like the source.
+connect(Run.Heartbeat,function()
+    if not alive then return end
+    for name,p in pairs(pages) do
+        local cols=columns[name]; p.CanvasSize=UDim2.fromOffset(0,math.max(cols[1].AbsoluteSize.Y,cols[2].AbsoluteSize.Y)/math.max(scale.Scale,.01)+12)
+    end
+end)
+startupStage='building controls'
+toggle('Aimbot','Weapon hold-to-fire V1','RevolverAutoFire')
+toggle('Aimbot','Weapon hold-to-fire V2','RevolverAutoFireV2')
+field('Aimbot','Repeat interval (0 = every frame)','RevolverFireInterval',0,0.5)
+do
+    -- Keep the profile keys so existing V1/V2 settings continue to load.
+    local weaponNames={revolver=true,gun=true,pistol=true,glock=true,silencer=true,silencedpistol=true,
+        shotgun=true,doublebarrel=true,doublebarrelsg=true,db=true,tacticalshotgun=true,drumshotgun=true,
+        silencerar=true,smg=true,silencersmg=true,p90=true,aug=true,ak47=true,ar=true,ar15=true,
+        rifle=true,assaultrifle=true,lmg=true,drumgun=true,uzi=true,mp5=true,
+        sniper=true,sniperrifle=true,rpg=true,rocketlauncher=true,flamethrower=true}
+    local function isWeapon(tool)
+        local name=(tool.Name:match('%[([^%]]+)%]') or tool.Name):lower():gsub('[^%w]','')
+        if weaponNames[name] then return true end
+        -- Custom guns may expose ammo rather than a standard weapon name.
+        for _,key in ipairs({'Ammo','Ammunition','Clip','Magazine'}) do
+            local value=tool:FindFirstChild(key,true)
+            if value and (value:IsA('IntValue') or value:IsA('NumberValue')) then return true end
+            if type(tool:GetAttribute(key))=='number' then return true end
+        end
+        return false
+    end
+    local pressed=false
+    local lastShot=0
+    local activeTool
+    local triggerDown=false
+    local lastMode
+    local function release()
+        if activeTool and activeTool.Parent then pcall(function() activeTool:Deactivate() end) end
+        activeTool=nil; triggerDown=false
+    end
+    connect(Input.InputBegan,function(input,processed)
+        if input.UserInputType~=Enum.UserInputType.MouseButton1 or processed or Input:GetFocusedTextBox() then return end
+        local mouse=Input:GetMouseLocation()
+        local pos,size=window.AbsolutePosition,window.AbsoluteSize
+        if window.Visible and mouse.X>=pos.X and mouse.Y>=pos.Y and mouse.X<=pos.X+size.X and mouse.Y<=pos.Y+size.Y then return end
+        pressed=true; lastShot=0
+    end)
+    connect(Input.InputEnded,function(input)
+        if input.UserInputType==Enum.UserInputType.MouseButton1 then pressed=false; release() end
+    end)
+    connect(Input.WindowFocusReleased,function() pressed=false; release() end)
+    connect(Run.Heartbeat,function()
+        if not alive or not (S.RevolverAutoFire or S.RevolverAutoFireV2) or not pressed or not clientFocused or Input:GetFocusedTextBox() then release(); return end
+        local character=LP.Character
+        local humanoid=character and character:FindFirstChildOfClass('Humanoid')
+        local tool=character and character:FindFirstChildOfClass('Tool')
+        if not humanoid or humanoid.Health<=0 or not tool or not isWeapon(tool) then release(); return end
+        local mode=S.RevolverAutoFireV2 and 'V2' or 'V1'
+        if lastMode~=mode or (activeTool and activeTool~=tool) then release(); lastMode=mode end
+        -- V2 gives the trigger a complete released frame between presses.
+        if mode=='V2' and triggerDown then
+            release()
+            return
+        end
+        local now=os.clock()
+        local interval=math.clamp(tonumber(S.RevolverFireInterval) or 0,0,.5)
+        if tool.Enabled and now-lastShot>=interval then
+            lastShot=now; activeTool=tool
+            -- Use normal tool input; the weapon retains its own cooldown and ammo checks.
+            if mode=='V2' then
+                tool:Activate(); triggerDown=true
+            else
+                tool:Deactivate(); tool:Activate()
+            end
+        end
+    end)
+    connect(gui.Destroying,release)
+end
+
+toggle('Aimbot','Enable aimlock','Aim')
+keybind('Aimbot','Bind','AimKey')
+cycle('Aimbot','Activation','AimMode',{'Hold','Toggle'})
+cycle('Aimbot','Aim part','Part',{'Head','HumanoidRootPart','UpperTorso','Torso'})
+toggle('Aimbot','Show FOV circle','ShowFOV')
+field('Aimbot','FOV radius (pixels)','FOV',10,1200)
+field('Aimbot','FOV color (#RRGGBB)','FOVColor')
+field('Aimbot','Smoothing (0 = instant)','Smooth',0,60)
+field('Aimbot','Prediction (seconds)','Prediction',0,1)
+field('Aimbot','Shake (studs)','Shake',0,5)
+toggle('Aimbot','Ignore teammates','TeamCheck')
+toggle('Aimbot','Visibility check','WallCheck')
+toggle('Aimbot','Locked target indicator','TargetIndicator')
+toggle('ESP','Enable ESP','ESP')
+for _,v in ipairs({{'2D box','Box','BoxColor'},{'Filled box','Fill','FillColor'},
+    {'3D box','Box3D','Box3DColor'},{'Player names','Names','NameColor'},
+    {'Skeleton','Skeleton','SkeletonColor'},{'Bottom tracers','Tracers','TracerColor'},
+    {'Center snaplines','Snaplines','SnapColor'}}) do
+    toggle('ESP',v[1],v[2]); field('ESP',v[1]..' color (#RRGGBB)',v[3])
+end
+field('ESP','Fill opacity','FillOpacity',0,1)
+field('ESP','Maximum distance (studs)','MaxDistance',50,20000)
+toggle('ESP','Health bar','HealthBar')
+field('ESP','Health bar color','HealthColor')
+toggle('ESP','Distance labels','Distance')
+field('ESP','Distance color','DistanceColor')
+toggle('World','Fullbright','Fullbright')
+toggle('World','Remove fog and atmosphere','NoFog')
+toggle('World','Override time of day','ClockOverride')
+field('World','Time of day (hours)','WorldTime',0,24)
+toggle('World','Override camera FOV','CameraOverride')
+field('World','Camera FOV (degrees)','CameraFOV',40,120)
+toggle('World','Extend camera zoom','ZoomOverride')
+field('World','Maximum zoom (studs)','MaxZoom',10,1000)
+local worldOriginal=setmetatable({}, {__mode='k'})
+local function restoreWorld()
+    for instance,properties in pairs(worldOriginal) do
+        for property,value in pairs(properties) do pcall(function() instance[property]=value end) end
+        worldOriginal[instance]=nil
+    end
+end
+connect(Run.Heartbeat,function()
+    local desired={}
+    local function want(instance,property,value)
+        if not instance then return end
+        desired[instance]=desired[instance] or {}; desired[instance][property]=value
+    end
+    if S.Fullbright then
+        want(Lighting,'Brightness',2); want(Lighting,'Ambient',Color3.fromRGB(200,200,200))
+        want(Lighting,'OutdoorAmbient',Color3.fromRGB(200,200,200)); want(Lighting,'GlobalShadows',false)
+    end
+    if S.NoFog then
+        want(Lighting,'FogStart',1000000); want(Lighting,'FogEnd',1000000)
+        for _,atmosphere in ipairs(Lighting:GetChildren()) do
+            if atmosphere:IsA('Atmosphere') then want(atmosphere,'Density',0); want(atmosphere,'Haze',0) end
+        end
+    end
+    if S.ClockOverride then want(Lighting,'ClockTime',S.WorldTime) end
+    if S.CameraOverride then want(workspace.CurrentCamera,'FieldOfView',S.CameraFOV) end
+    if S.ZoomOverride then want(LP,'CameraMaxZoomDistance',math.max(S.MaxZoom,LP.CameraMinZoomDistance)) end
+    for instance,properties in pairs(worldOriginal) do
+        for property,value in pairs(properties) do
+            if not desired[instance] or desired[instance][property]==nil then
+                pcall(function() instance[property]=value end); properties[property]=nil
+            end
+        end
+        if next(properties)==nil then worldOriginal[instance]=nil end
+    end
+    for instance,properties in pairs(desired) do
+        for property,value in pairs(properties) do
+            worldOriginal[instance]=worldOriginal[instance] or {}
+            if worldOriginal[instance][property]==nil then worldOriginal[instance][property]=instance[property] end
+            instance[property]=value
+        end
+    end
+end)
+startupStage='building misc controls'
+local targetRow=row('Misc','Selected target'); local targetButton
+local function targetLabel() targetButton.Text=selected and selected.Name or 'Select player' end
+targetButton=button(targetRow,'Select player',UDim2.new(1,-214,0,9),UDim2.fromOffset(200,26),function()
+    local options={}; for _,p in ipairs(Players:GetPlayers()) do if p~=LP then table.insert(options,p) end end
+    table.sort(options,function(a,b) return a.Name<b.Name end)
+    local idx=table.find(options,selected) or 0; selected=options[idx+1]; targetLabel()
+end)
+local function rig(p)
+    local c=p and p.Character; local h=c and c:FindFirstChildOfClass('Humanoid')
+    local root=c and c:FindFirstChild('HumanoidRootPart')
+    if c and h and root and h.Health>0 then return c,h,root end
+    return nil,nil,nil
+end
+local function action(label,fn)
+    local r=row('Misc',label); button(r,'Run',UDim2.new(1,-84,0,5),UDim2.fromOffset(68,34),fn)
+end
+action('Teleport to selected target',function()
+    local _,_,root=rig(LP); local _,_,other=rig(selected)
+    root=desync and desync.proxyRoot or root
+    if root and other then root.CFrame=other.CFrame*CFrame.new(0,0,3); notify('Teleported') else notify('Select a living target') end
+end)
+toggle('Misc','Fly (WASD / Space / Ctrl)','Fly')
+keybind('Misc','Fly hotkey','FlyKey')
+field('Misc','Fly speed','FlySpeed',1,300)
+toggle('Misc','Infinite jump','InfiniteJump')
+toggle('Misc','Override jump height','JumpOverride')
+field('Misc','Jump height (studs)','JumpHeight',0,100)
+toggle('Misc','Noclip','Noclip')
+toggle('Misc','Override walk speed','Speed')
+field('Misc','Walk speed','WalkSpeed',0,250)
+toggle('Misc','Auto-pick next stand target','StandAutoReplace')
+toggle('Misc','Resume stand after respawn','StandAutoResume')
+toggle('Misc','Void desync','Desync')
+keybind('Misc','Desync hotkey','DesyncKey')
+field('Misc','Desync aura color','DesyncColor')
+toggle('Misc','Start position marker','DesyncMarker')
+toggle('Misc','Travel trail','DesyncTrail')
+local function finishFling()
+    if not fling then return end
+    local f=fling; fling=nil
+    if f.root.Parent then f.root.AssemblyAngularVelocity=Vector3.zero; f.root.AssemblyLinearVelocity=Vector3.zero; f.root.CFrame=f.origin end
+    if f.hum.Parent then f.hum.AutoRotate=f.auto end
+end
+action('Fling selected target',function()
+    finishFling()
+    local _,h,r=rig(LP); local _,_,t=rig(selected)
+    if not r or not t then notify('Select a living target'); return end
+    if S.Fly then notify('Turn fly off first'); return end
+    if S.Desync then notify('Turn desync off first'); return end
+    fling={root=r,hum=h,target=t,origin=r.CFrame,auto=h.AutoRotate,untilTime=os.clock()+1.25}
+    h.AutoRotate=false; notify('Fling attempt: server physics may reject it')
+end)
+field('Settings','UI accent (#RRGGBB)','Accent')
+toggle('Settings','Compact hotkey overlay','HotkeyOverlay')
+keybind('Settings','Show / hide UI hotkey','UIKey')
+local function normalizeAnimationID(value)
+    if type(value)~='string' then return nil end
+    local id=value:match('^%s*(%d+)%s*$') or value:match('^rbxassetid://(%d+)$')
+        or value:match('/catalog/(%d+)') or value:match('/store/asset/(%d+)')
+    if id and #id<=19 and id:find('[1-9]') then return id end
+    return nil
+end
+local profileNames={'Default','Combat','Travel'}
+local profiles=type(env.VeilsProfiles)=='table' and env.VeilsProfiles or {}
+env.VeilsProfiles=profiles
+cycle('Settings','Profile','Profile',profileNames)
+local function profilePath(name)
+    assert(table.find(profileNames,name),'Unknown profile')
+    return name=='Default' and 'VeilsUniverse.json' or 'VeilsUniverse_'..name..'.json'
+end
+local function applyProfile(data)
+    for k,v in pairs(data) do
+        if k~='Profile' and S[k]~=nil and type(v)==type(S[k]) then
+            if type(v)=='boolean' then S[k]=v
+            elseif type(v)=='number' and v==v and math.abs(v)<1e6 then S[k]=v
+            elseif type(v)=='string' and #v<80 then
+                if k:find('Color') or k=='Accent' then if v:match('^#%x%x%x%x%x%x$') then S[k]=v end
+                elseif k=='AimMode' then if v=='Hold' or v=='Toggle' then S[k]=v end
+                elseif k=='FlyAnimationID' or k=='HoverAnimationID' then local id=normalizeAnimationID(v); if id then S[k]=id end
+                elseif k=='Part' then if table.find({'Head','HumanoidRootPart','UpperTorso','Torso'},v) then S[k]=v end
+                elseif validInputs[v] then S[k]=v end
+            end
+        end
+    end
+    S.FOV=math.clamp(S.FOV,10,1200); S.Smooth=math.clamp(S.Smooth,0,60)
+    S.Prediction=math.clamp(S.Prediction,0,1); S.Shake=math.clamp(S.Shake,0,5)
+    S.FillOpacity=math.clamp(S.FillOpacity,0,1); S.MaxDistance=math.clamp(S.MaxDistance,50,20000)
+    S.FlySpeed=math.clamp(S.FlySpeed,1,300); S.WalkSpeed=math.clamp(S.WalkSpeed,0,250)
+    S.JumpHeight=math.clamp(S.JumpHeight,0,100)
+    S.WorldTime=math.clamp(S.WorldTime,0,24); S.CameraFOV=math.clamp(S.CameraFOV,40,120); S.MaxZoom=math.clamp(S.MaxZoom,10,1000)
+    held=false; latched=false; locked=nil; refresh()
+end
+local function saveProfile()
+    local snapshot=table.clone(S); snapshot.Profile=nil
+    profiles[S.Profile]=snapshot
+    local saved=false
+    if type(writefile)=='function' then
+        saved=pcall(function() writefile(profilePath(S.Profile),Http:JSONEncode(snapshot)) end)
+    end
+    notify('Saved '..S.Profile..(saved and '' or ' (session only)'))
+end
+local function loadProfile()
+    local data=profiles[S.Profile]
+    if type(data)~='table' and type(readfile)=='function' then
+        local ok,value=pcall(function() return Http:JSONDecode(readfile(profilePath(S.Profile))) end)
+        if ok and type(value)=='table' then data=value end
+    end
+    if type(data)~='table' then notify('No saved '..S.Profile..' profile'); return end
+    applyProfile(data); notify('Loaded '..S.Profile)
+end
+local profileRow=row('Settings','','Profile')
+button(profileRow,'Save',UDim2.fromOffset(16,3),UDim2.fromOffset(166,36),saveProfile)
+button(profileRow,'Load',UDim2.fromOffset(194,3),UDim2.fromOffset(166,36),loadProfile)
+do
+    local fields={}
+    for _,item in ipairs({{'Moving ID','FlyAnimationID'},{'Hover ID','HoverAnimationID'}}) do
+        local key=item[2]
+        local r=row('Settings',item[1],key)
+        local label=r:FindFirstChildOfClass('TextLabel'); label.Size=UDim2.fromOffset(112,44)
+        local input=make('TextBox',{Position=UDim2.fromOffset(136,7),Size=UDim2.fromOffset(224,30),Text=S[key],
+            ClearTextOnFocus=false,PlaceholderText='Emote or animation ID',BackgroundColor3=C.inset,
+            TextColor3=C.text,PlaceholderColor3=C.muted,Font=Enum.Font.Gotham,TextSize=12,ZIndex=13},r); round(input,7); stroke(input)
+        fields[key]=input
+        local last=S[key]
+        table.insert(refreshers,function() if S[key]~=last then input.Text=S[key]; last=S[key] end end)
+    end
+    local actions=row('Settings','','FlyAnimationID')
+    button(actions,'Apply',UDim2.fromOffset(16,3),UDim2.fromOffset(166,36),function()
+        local moving=normalizeAnimationID(fields.FlyAnimationID.Text)
+        local hover=normalizeAnimationID(fields.HoverAnimationID.Text)
+        if not moving or not hover then notify('Enter valid moving and hover IDs'); return end
+        S.FlyAnimationID=moving; S.HoverAnimationID=hover
+        fields.FlyAnimationID.Text=moving; fields.HoverAnimationID.Text=hover
+        if stopFlightAnimation then stopFlightAnimation() end
+        refresh(); notify('Flight and hover IDs applied')
+    end)
+    button(actions,'Reset',UDim2.fromOffset(194,3),UDim2.fromOffset(166,36),function()
+        S.FlyAnimationID='73602135057541'; S.HoverAnimationID='131145074585836'
+        fields.FlyAnimationID.Text=S.FlyAnimationID; fields.HoverAnimationID.Text=S.HoverAnimationID
+        if stopFlightAnimation then stopFlightAnimation() end
+        refresh(); notify('Flight animation IDs reset')
+    end)
+end
+do
+    local r=row('Settings','Credits: private property made this shit')
+    local label=r:FindFirstChildOfClass('TextLabel')
+    if label then label.Text='private property made this shit' end
+end
+row('Settings','No remote loaders. Re-execution cleans up the previous instance.')
+local unload
+local unloadRow=row('Settings','','Unload')
+button(unloadRow,'Unload script',UDim2.fromOffset(16,3),UDim2.fromOffset(344,36),function()
+    if unload then unload() end
+end)
+-- Visual-only rigs: anchor every part, including late-loading accessory handles.
+local function freezeVisualPart(x)
+    if x:IsA('BasePart') then
+        x.Anchored=true; x.CanCollide=false; x.CanTouch=false; x.CanQuery=false
+        x.Massless=true; x.AssemblyLinearVelocity=Vector3.zero; x.AssemblyAngularVelocity=Vector3.zero
+    elseif x:IsA('LuaSourceContainer') or x:IsA('Animator') or x:IsA('BodyMover') or x:IsA('Constraint') then
+        x:Destroy()
+    end
+end
+local function solveVisualRig(model)
+    local root=model:FindFirstChild('HumanoidRootPart'); if not root then return end
+    local visited={[root]=true}
+    local joints={}
+    for _,x in ipairs(model:GetDescendants()) do
+        if x:IsA('Motor6D') and x.Part0 and x.Part1 then table.insert(joints,x) end
+    end
+    -- Resolve the joint tree explicitly: anchored rigs do not receive solver-driven joint positioning.
+    for _=1,#joints+1 do
+        local changed=false
+        for _,joint in ipairs(joints) do
+            if visited[joint.Part0] and not visited[joint.Part1] then
+                joint.Part1.CFrame=joint.Part0.CFrame*joint.C0*joint.Transform*joint.C1:Inverse()
+                visited[joint.Part1]=true; changed=true
+            end
+        end
+        if not changed then break end
+    end
+end
+local function syncVisualAccessories(model)
+    local attachments={}
+    for _,body in ipairs(model:GetChildren()) do
+        if body:IsA('BasePart') then
+            for _,x in ipairs(body:GetChildren()) do if x:IsA('Attachment') then attachments[x.Name]=x end end
+        end
+    end
+    for _,accessory in ipairs(model:GetChildren()) do
+        if accessory:IsA('Accessory') then
+            local handle=accessory:FindFirstChild('Handle')
+            if handle and handle:IsA('BasePart') then
+                local placed=false
+                for _,attachment in ipairs(handle:GetChildren()) do
+                    if attachment:IsA('Attachment') and attachments[attachment.Name] then
+                        handle.CFrame=attachments[attachment.Name].WorldCFrame*attachment.CFrame:Inverse(); placed=true; break
+                    end
+                end
+                if not placed then
+                    local weld=handle:FindFirstChild('AccessoryWeld')
+                    if weld and weld:IsA('Weld') and weld.Part0 and weld.Part1 then
+                        if weld.Part0==handle then handle.CFrame=weld.Part1.CFrame*weld.C1*weld.C0:Inverse()
+                        elseif weld.Part1==handle then handle.CFrame=weld.Part0.CFrame*weld.C0*weld.C1:Inverse() end
+                    end
+                end
+            end
+        end
+    end
+end
+local function prepareVisualModel(model)
+    for _,x in ipairs(model:GetDescendants()) do freezeVisualPart(x) end
+    connect(model.DescendantAdded,freezeVisualPart)
+    local h=model:FindFirstChildOfClass('Humanoid')
+    if h then
+        h.DisplayDistanceType=Enum.HumanoidDisplayDistanceType.None
+        h.PlatformStand=true; h.AutoRotate=false
+        pcall(function() h.EvaluateStateMachine=false end)
+    end
+    solveVisualRig(model); syncVisualAccessories(model)
+end
+local function visualBodyBounds(model)
+    local low=Vector3.new(math.huge,math.huge,math.huge); local high=-low
+    for _,part in ipairs(model:GetChildren()) do
+        if part:IsA('BasePart') and part.Name~='HumanoidRootPart' then
+            for x=-1,1,2 do for y=-1,1,2 do for z=-1,1,2 do
+                local p=part.CFrame:PointToWorldSpace(part.Size*Vector3.new(x,y,z)/2)
+                low=Vector3.new(math.min(low.X,p.X),math.min(low.Y,p.Y),math.min(low.Z,p.Z))
+                high=Vector3.new(math.max(high.X,p.X),math.max(high.Y,p.Y),math.max(high.Z,p.Z))
+            end end end
+        end
+    end
+    if low.X==math.huge then return CFrame.new(),Vector3.new(4,6,2) end
+    return CFrame.new((low+high)/2),high-low
+end
+
+-- Live ESP preview occupies the left column beside Lines.
+local rebuildESPPreview
+do
+    local preview=card('ESP','ESP preview',1); preview.frame.Size=UDim2.fromOffset(376,298)
+    local viewport=make('ViewportFrame',{Position=UDim2.fromOffset(16,48),Size=UDim2.fromOffset(344,234),
+        BackgroundColor3=C.inset,BorderSizePixel=0,Ambient=Color3.fromRGB(185,185,195),
+        LightColor=Color3.new(1,1,1),LightDirection=Vector3.new(-1,-1,-2),ZIndex=12},preview.frame); round(viewport,10)
+    local world=make('WorldModel',{},viewport)
+    local camera=make('Camera',{FieldOfView=35},viewport); viewport.CurrentCamera=camera
+    local paint=make('Frame',{Size=UDim2.fromScale(1,1),BackgroundTransparency=1,ZIndex=14,ClipsDescendants=true},viewport)
+    local hint=text(viewport,'Loading preview...',UDim2.fromOffset(12,90),UDim2.fromOffset(320,30)); hint.TextSize=12
+    local model,bounds,size
+    local previewName=LP.DisplayName
+    local generation,loading=0,false
+    local function project(point)
+        local v=camera.CFrame:PointToObjectSpace(point)
+        local depth=math.max(.01,-v.Z)
+        local focal=234/(2*math.tan(math.rad(camera.FieldOfView/2)))
+        return Vector2.new(172+v.X/depth*focal,117-v.Y/depth*focal)
+    end
+    local function draw()
+        for _,x in ipairs(paint:GetChildren()) do x:Destroy() end
+        if not model or not bounds then return end
+        local points={}; local lo=Vector2.new(math.huge,math.huge); local hi=-lo
+        for x=-1,1,2 do for y=-1,1,2 do for z=-1,1,2 do
+            local p=project(bounds:PointToWorldSpace(size*Vector3.new(x,y,z)/2)); table.insert(points,p)
+            lo=Vector2.new(math.min(lo.X,p.X),math.min(lo.Y,p.Y)); hi=Vector2.new(math.max(hi.X,p.X),math.max(hi.Y,p.Y))
+        end end end
+        local function ln(a,b,col,width) segment(paint,a.X,a.Y,b.X,b.Y,col,width or 1,16) end
+        if S.Fill then make('Frame',{Position=UDim2.fromOffset(lo.X,lo.Y),Size=UDim2.fromOffset(hi.X-lo.X,hi.Y-lo.Y),
+            BackgroundColor3=color(S.FillColor),BackgroundTransparency=1-S.FillOpacity,BorderSizePixel=0,ZIndex=14},paint) end
+        local a,b,c,d=lo,Vector2.new(hi.X,lo.Y),hi,Vector2.new(lo.X,hi.Y)
+        if S.Box then local col=color(S.BoxColor); ln(a,b,col); ln(b,c,col); ln(c,d,col); ln(d,a,col) end
+        if S.Box3D then
+            for _,edge in ipairs({{1,2},{1,3},{1,5},{2,4},{2,6},{3,4},{3,7},{4,8},{5,6},{5,7},{6,8},{7,8}}) do
+                ln(points[edge[1]],points[edge[2]],color(S.Box3DColor))
+            end
+        end
+        if S.Names then
+            local label=text(paint,previewName,UDim2.fromOffset(0,math.max(0,lo.Y-18)),UDim2.fromOffset(344,16))
+            label.TextXAlignment=Enum.TextXAlignment.Center; label.TextSize=11; label.TextColor3=color(S.NameColor); label.ZIndex=17
+        end
+        if S.Distance then
+            local label=text(paint,'42 studs (sample)',UDim2.fromOffset(0,math.min(218,hi.Y+3)),UDim2.fromOffset(344,16))
+            label.TextXAlignment=Enum.TextXAlignment.Center; label.TextSize=10; label.TextColor3=color(S.DistanceColor); label.ZIndex=17
+        end
+        if S.HealthBar then
+            ln(Vector2.new(lo.X-5,lo.Y),Vector2.new(lo.X-5,hi.Y),C.stroke,4)
+            ln(Vector2.new(lo.X-5,hi.Y),Vector2.new(lo.X-5,hi.Y-(hi.Y-lo.Y)*.75),color(S.HealthColor),2)
+        end
+        local foot=Vector2.new((lo.X+hi.X)/2,hi.Y)
+        if S.Tracers then ln(Vector2.new(172,234),foot,color(S.TracerColor)) end
+        if S.Snaplines then ln(Vector2.new(172,117),project(Vector3.zero),color(S.SnapColor)) end
+        if S.Skeleton then
+            for _,joint in ipairs(model:GetDescendants()) do
+                if joint:IsA('Motor6D') and joint.Part0 and joint.Part1 and joint.Part0.Parent==model and joint.Part1.Parent==model then
+                    ln(project(joint.Part0.Position),project(joint.Part1.Position),color(S.SkeletonColor),1.5)
+                end
+            end
+        end
+    end
+    rebuildESPPreview=function(description,name)
+        if loading and not description and not name then return end
+        generation=generation+1; local token=generation; loading=true
+        if name then previewName=name end
+        local supplied=description and description:Clone()
+        task.spawn(function()
+            local newModel
+            local desc=supplied
+            local ok,err=pcall(function()
+                local humanoid=LP.Character and LP.Character:FindFirstChildOfClass('Humanoid')
+                if not desc then desc=humanoid and humanoid:GetAppliedDescription() or Players:GetHumanoidDescriptionFromUserIdAsync(LP.UserId) end
+                newModel=Players:CreateHumanoidModelFromDescriptionAsync(desc,humanoid and humanoid.RigType or Enum.HumanoidRigType.R15)
+            end)
+            if desc then desc:Destroy() end
+            if not alive or token~=generation then if newModel then newModel:Destroy() end; return end
+            loading=false
+            if not ok or not newModel then hint.Text='Preview unavailable'; warn('[Veils preview] '..tostring(err)); return end
+            if model then model:Destroy() end
+            model=newModel
+            prepareVisualModel(model)
+            model.Parent=world
+            local box=visualBodyBounds(model)
+            model:PivotTo(CFrame.new(-box.Position)*model:GetPivot())
+            syncVisualAccessories(model)
+            bounds,size=visualBodyBounds(model)
+            local vertical=math.tan(math.rad(camera.FieldOfView/2))
+            local distance=math.max(size.Y/(2*vertical),size.X/(2*vertical*(344/234)))*1.4+size.Z/2
+            camera.CFrame=CFrame.lookAt(Vector3.new(0,0,-distance),Vector3.zero)
+            hint.Visible=false; draw()
+        end)
+    end
+    table.insert(refreshers,draw)
+    connect(pages.ESP:GetPropertyChangedSignal('Visible'),function()
+        if pages.ESP.Visible and not model then rebuildESPPreview() end
+    end)
+end
+
+-- Small identity card uses the actual Roblox player; no fabricated process/PID status.
+do
+    make('Frame',{Position=UDim2.fromOffset(12,542),Size=UDim2.fromOffset(160,1),BackgroundColor3=C.stroke,ZIndex=12},sidebar)
+    local identity=make('Frame',{Position=UDim2.fromOffset(12,552),Size=UDim2.fromOffset(160,60),BackgroundTransparency=1,ZIndex=12},sidebar)
+    local portrait=make('ImageLabel',{Position=UDim2.fromOffset(4,10),Size=UDim2.fromOffset(36,36),BackgroundColor3=C.inset,ZIndex=12},identity); round(portrait,99)
+    local name=text(identity,LP.DisplayName,UDim2.fromOffset(51,6),UDim2.fromOffset(103,18)); name.TextSize=11; name.TextColor3=C.text; name.TextTruncate=Enum.TextTruncate.AtEnd
+    local handle=text(identity,'@'..LP.Name,UDim2.fromOffset(51,25),UDim2.fromOffset(103,16)); handle.TextSize=10; handle.TextTruncate=Enum.TextTruncate.AtEnd
+    local connected=text(identity,'Connected',UDim2.fromOffset(51,43),UDim2.fromOffset(103,16)); connected.TextSize=10; connected.TextColor3=Color3.fromRGB(100,220,150)
+    task.spawn(function()
+        local ok,url=pcall(function() return Players:GetUserThumbnailAsync(LP.UserId,Enum.ThumbnailType.HeadShot,Enum.ThumbnailSize.Size100x100) end)
+        if ok and alive then portrait.Image=url end
+    end)
+end
+
+local dragState
+local function pointInside(object,p)
+    local a,b=object.AbsolutePosition,object.AbsoluteSize
+    return p.X>=a.X and p.Y>=a.Y and p.X<=a.X+b.X and p.Y<=a.Y+b.Y
+end
+local function beginMenuDrag(i)
+    local kind=i.UserInputType
+    if kind~=Enum.UserInputType.MouseButton1 and kind~=Enum.UserInputType.Touch then return end
+    if not window.Visible or binding or popup or dragState or paletteOpen then return end
+    local p=Vector2.new(i.Position.X,i.Position.Y)
+    if not pointInside(window,p) or pointInside(closeButton,p) or pointInside(quickSettings,p) then return end
+    if p.Y>window.AbsolutePosition.Y+window.AbsoluteSize.Y*(66/620) then return end
+    local focused=Input:GetFocusedTextBox()
+    if focused then focused:ReleaseFocus() end
+    dragState={input=i,touch=kind==Enum.UserInputType.Touch,origin=p,
+        position=window.Position,absolute=window.AbsolutePosition}
+end
+local function moveMenuDrag(i)
+    local drag=dragState; if not drag then return end
+    if not window.Visible then dragState=nil; return end
+    if drag.touch then
+        if i~=drag.input then return end
+    elseif i.UserInputType~=Enum.UserInputType.MouseMovement then return
+    elseif not Input:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then dragState=nil; return end
+    local delta=Vector2.new(i.Position.X,i.Position.Y)-drag.origin
+    local topLeft=drag.absolute+delta
+    local camera=workspace.CurrentCamera
+    if camera and camera.ViewportSize.X>0 and camera.ViewportSize.Y>0 then
+        local view=camera.ViewportSize
+        topLeft=Vector2.new(math.clamp(topLeft.X,80-window.AbsoluteSize.X,math.max(0,view.X-80)),
+            math.clamp(topLeft.Y,0,math.max(0,view.Y-40)))
+    end
+    delta=topLeft-drag.absolute
+    window.Position=UDim2.new(drag.position.X.Scale,drag.position.X.Offset+delta.X,
+        drag.position.Y.Scale,drag.position.Y.Offset+delta.Y)
+end
+local function endMenuDrag(i)
+    if dragState and (i==dragState.input or (not dragState.touch and i.UserInputType==Enum.UserInputType.MouseButton1)) then dragState=nil end
+end
+-- Global pointer capture avoids dependence on title-label hit testing or decorative snow layers.
+connect(Input.InputBegan,beginMenuDrag)
+connect(Input.InputChanged,moveMenuDrag)
+connect(Input.InputEnded,endMenuDrag)
+connect(window:GetPropertyChangedSignal('Visible'),function() if not window.Visible then dragState=nil end end)
+local function inputName(i)
+    if i.KeyCode~=Enum.KeyCode.Unknown then return i.KeyCode.Name end
+    return i.UserInputType.Name
+end
+connect(Input.InputBegan,function(i,processed)
+    if binding then
+        local name=inputName(i)
+        if name=='Escape' then binding=nil
+        elseif i.KeyCode~=Enum.KeyCode.Unknown or name=='MouseButton1' or name=='MouseButton2' or name=='MouseButton3' then
+            S[binding]=name; binding=nil; held=false; latched=false; locked=nil
+        end
+        refresh(); return
+    end
+    if paletteOpen or Input:GetFocusedTextBox() then return end
+    local name=inputName(i)
+    if name==S.UIKey then window.Visible=not window.Visible end
+    if not processed and name==S.FlyKey then S.Fly=not S.Fly; refresh() end
+    if not processed and name==S.DesyncKey then S.Desync=not S.Desync; refresh() end
+    if not processed and name==S.AimKey and S.Aim then
+        if S.AimMode=='Hold' then held=true else latched=not latched end
+        locked=nil
+    end
+end)
+connect(Input.InputEnded,function(i)
+    if inputName(i)==S.AimKey then held=false; if S.AimMode=='Hold' then locked=nil end end
+end)
+connect(Input.WindowFocusReleased,function() clientFocused=false; held=false; latched=false; locked=nil; dragState=nil end)
+connect(Input.WindowFocused,function() clientFocused=true end)
+-- Resolve both Marketplace emote wrappers once per flight session.
+local flightAnimationSignature
+local flightAnimations={}
+local flightAnimationGeneration=0
+local flightAnimationMode
+stopFlightAnimation=function()
+    flightAnimationGeneration=flightAnimationGeneration+1
+    for _,entry in pairs(flightAnimations) do
+        if entry.track then pcall(function() entry.track:Stop(.15); entry.track:Destroy() end) end
+        if entry.asset then entry.asset:Destroy() end
+    end
+    flightAnimations={}; flightAnimationMode=nil; flightAnimationSignature=nil
+end
+local function ensureFlightAnimation(h,mode)
+    if flightAnimations[mode] then return end
+    local entry={loading=true,restartAt=0,startedAt=0}
+    flightAnimations[mode]=entry
+    local emoteID=mode=='Moving' and S.FlyAnimationID or S.HoverAnimationID
+    local generation=flightAnimationGeneration
+    local function current()
+        return alive and generation==flightAnimationGeneration and S.Fly
+            and (not S.Desync or (desync and desync.proxyHumanoid==h))
+            and flightHumanoid==h and h.Parent~=nil and h.Health>0
+            and emoteID==(mode=='Moving' and S.FlyAnimationID or S.HoverAnimationID)
+    end
+    task.spawn(function()
+        local objects,asset,track
+        local ok,err=pcall(function()
+            local animator=h:FindFirstChildOfClass('Animator')
+            assert(animator,'Character Animator missing')
+            objects=game:GetObjects('rbxassetid://'..emoteID)
+            assert(type(objects)=='table','Object loading did not return an asset')
+            local underlying
+            local function inspect(x)
+                if x:IsA('KeyframeSequence') or x:IsA('CurveAnimation') then
+                    underlying='rbxassetid://'..emoteID
+                elseif x:IsA('Animation') then
+                    local uri=x.AnimationId
+                    local number=uri:match('rbxassetid://(%d+)') or uri:match('[?&]id=(%d+)') or uri:match('^(%d+)$')
+                    if number and number~=emoteID then underlying='rbxassetid://'..number end
+                end
+            end
+            for _,object in ipairs(objects) do
+                inspect(object)
+                for _,child in ipairs(object:GetDescendants()) do inspect(child) end
+            end
+            assert(underlying,'The emote wrapper did not expose an embedded AnimationId')
+            if not current() then return end
+            asset=Instance.new('Animation'); asset.AnimationId=underlying
+            track=animator:LoadAnimation(asset)
+            track.Priority=Enum.AnimationPriority.Action4; track.Looped=true
+            print('[Veils Universe] Resolved '..mode..' animation: '..underlying)
+        end)
+        if objects then for _,object in ipairs(objects) do pcall(function() object:Destroy() end) end end
+        if not ok or not current() then
+            if track then pcall(function() track:Stop(.1); track:Destroy() end) end
+            if asset then asset:Destroy() end
+            if current() then
+                entry.loading=false; entry.failed=true
+                notify(mode..' animation failed to resolve; flight controls remain active')
+                warn('[Veils Universe '..mode..' animation] '..tostring(err))
+            end
+            return
+        end
+        entry.track=track; entry.asset=asset; entry.loading=false
+        -- Playback is selected by movement state, never by asynchronous load completion.
+    end)
+end
+local function updateFlightAnimation(h,moving)
+    local signature=S.FlyAnimationID..':'..S.HoverAnimationID
+    if flightAnimationSignature~=signature then stopFlightAnimation(); flightAnimationSignature=signature end
+    ensureFlightAnimation(h,'Moving'); ensureFlightAnimation(h,'Hover')
+    local desired=moving and 'Moving' or 'Hover'
+    local entry=flightAnimations[desired]
+    if not entry or not entry.track or entry.failed then return end
+    local now=os.clock()
+    if flightAnimationMode~=desired then
+        local previous=flightAnimationMode and flightAnimations[flightAnimationMode]
+        if previous and previous.track then previous.track:Stop(.2) end
+        flightAnimationMode=desired
+        entry.track:Play(.2,1,1); entry.startedAt=now; entry.restartAt=now+1
+    elseif entry.track.Length==0 and now-entry.startedAt>8 then
+        entry.failed=true; entry.track:Stop(.15); flightAnimationMode=nil
+        notify(desired..' animation did not load in this experience')
+    elseif entry.track.Length>0 and not entry.track.IsPlaying and now>entry.restartAt then
+        entry.restartAt=now+1; entry.track:Play(.2,1,1)
+    end
+end
+local function stopFlight()
+    stopFlightAnimation()
+    if flight and flight.Parent and flight.Parent:IsA('BasePart') then
+        flight.Parent.AssemblyLinearVelocity=Vector3.zero
+        flight.Parent.AssemblyAngularVelocity=Vector3.zero
+    end
+    if flight then flight:Destroy(); flight=nil end
+    if flightOrientation then flightOrientation:Destroy(); flightOrientation=nil end
+    if flightAttachment then flightAttachment:Destroy(); flightAttachment=nil end
+    if flightHumanoid and flightHumanoid.Parent then
+        flightHumanoid.AutoRotate=oldAutoRotate; flightHumanoid.PlatformStand=oldPlatform
+    end
+    flightHumanoid=nil
+end
+local function stopFollowing(message,restoreFly)
+    local state=followState; followState=nil
+    if not state then return end
+    if restoreFly~=false then S.Fly=state.previousFly end
+    stopFlight()
+    if alive then refresh(); if message then notify(message) end end
+end
+local function findFollowTarget(query,exclude)
+    local needle=query:lower():gsub('^@',''):gsub('^%(',''):gsub('%)$','')
+    if needle=='random' then
+        local candidates={}
+        for _,player in ipairs(Players:GetPlayers()) do
+            if player~=LP and player~=exclude and player.Parent==Players and rig(player) then table.insert(candidates,player) end
+        end
+        if #candidates==0 then return nil,'No other living players available' end
+        return candidates[Random.new():NextInteger(1,#candidates)]
+    end
+    local exact,prefix={},{}
+    for _,player in ipairs(Players:GetPlayers()) do
+        if player~=LP then
+            local name,display=player.Name:lower(),player.DisplayName:lower()
+            if name==needle then return player end
+            if display==needle then table.insert(exact,player) end
+            if name:sub(1,#needle)==needle or display:sub(1,#needle)==needle then table.insert(prefix,player) end
+        end
+    end
+    if #exact==1 then return exact[1] end
+    if #exact>1 or #prefix>1 then return nil,'More than one match; use the full username' end
+    if #prefix==1 then return prefix[1] end
+    return nil,'Player not found'
+end
+local function startFollowing(query,mode)
+    local target,err=findFollowTarget(query)
+    if not target then notify(err); return end
+    local character=rig(LP); local other=rig(target)
+    if not character or not other then notify('Both characters must be alive for stand mode'); return end
+    local previous=followState and followState.previousFly
+    if not followState then previous=S.Fly end
+    followState={target=target,previousFly=previous,localCharacter=character,targetCharacter=other,
+        mode=mode or 'stand',phaseStart=os.clock(),lastMotionAt=-math.huge}
+    S.Fly=true; refresh(); notify((mode=='orbit' and 'Orbiting @' or 'Stand linked to @')..target.Name..' - .unstand to release')
+end
+local function replaceStandTarget(state,exclude)
+    if state.controllerUserId then return false end
+    if not S.StandAutoReplace then return false end
+    local target=findFollowTarget('random',exclude or state.target)
+    if not target then return false end
+    state.target=target; state.targetCharacter=target.Character
+    state.phaseStart=os.clock(); state.lastMotionAt=-math.huge
+    notify('Stand switched to @'..target.Name)
+    return true
+end
+local function followGoal(state)
+    if LP.Character~=state.localCharacter then return nil,'Stand ended: your character changed' end
+    local character,humanoid,root=rig(state.target)
+    if state.target.Parent~=Players or not character or character~=state.targetCharacter then
+        if not replaceStandTarget(state,state.target) then return nil,'Stand ended: no replacement target available' end
+        character,humanoid,root=rig(state.target)
+    end
+    if not character or not root then return nil,'Stand ended: target unavailable' end
+    local goal
+    if state.mode=='underground' then
+        -- Begin below the normal stand slot, then rise into formation once.
+        local startY=math.max(root.Position.Y-7,workspace.FallenPartsDestroyHeight+20)
+        local endY=root.Position.Y+1.5
+        if startY>=endY then return nil,'Stand entrance is too close to the void boundary' end
+        state.entranceStartedAt=state.entranceStartedAt or os.clock()
+        local progress=math.clamp((os.clock()-state.entranceStartedAt)/1.35,0,1)
+        local eased=progress*progress*(3-2*progress)
+        local slot=root.CFrame*CFrame.new(3,0,4.5)
+        goal=slot+Vector3.new(0,startY+(endY-startY)*eased-slot.Position.Y,0)
+        if progress<1 then return goal,Vector3.zero,false,true end
+        state.mode='stand'; state.entranceStartedAt=nil
+    elseif state.mode=='orbit' then
+        local angle=(os.clock()-state.phaseStart)*.55+math.atan2(4.5,3)
+        local radius=math.sqrt(3*3+4.5*4.5)
+        goal=root.CFrame*CFrame.new(math.cos(angle)*radius,1.5,math.sin(angle)*radius)
+    else goal=root.CFrame*CFrame.new(3,1.5,4.5) end
+    local speed=Vector3.new(root.AssemblyLinearVelocity.X,0,root.AssemblyLinearVelocity.Z).Magnitude
+    if speed>1.5 or humanoid.MoveDirection.Magnitude>.1 then state.lastMotionAt=os.clock() end
+    local moving=os.clock()-state.lastMotionAt<.25
+    return goal,root.AssemblyLinearVelocity,moving
+end
+local function changeStandWhitelist(argument,remove)
+    local query=argument:match('^%s*(.-)%s*$')
+    if query=='' or query:lower()=='list' then
+        local names={}; for _,entry in pairs(standWhitelist) do table.insert(names,'@'..entry.Name) end
+        table.sort(names); notify(#names>0 and ('Whitelisted: '..table.concat(names,', ')) or 'Stand whitelist is empty'); return
+    end
+    if remove and query:lower()=='all' then
+        standWhitelist={}
+        if followState and followState.controllerUserId then stopFollowing('Whitelist cleared; stand released') end
+        notify('Stand whitelist cleared'); return
+    end
+    if query:lower()=='random' then notify('Use a specific username for the whitelist'); return end
+    local player,err=findFollowTarget(query)
+    local userId=player and player.UserId
+    if remove and not userId then
+        local needle=query:lower():gsub('^@','')
+        for id,entry in pairs(standWhitelist) do if entry.Name:lower()==needle then userId=id; break end end
+    end
+    if not userId then notify(err or 'Player not found'); return end
+    if remove then
+        standWhitelist[userId]=nil
+        if followState and followState.controllerUserId==userId then stopFollowing('Access revoked; stand released') end
+        notify('Removed stand access')
+    else
+        standWhitelist[userId]={Name=player.Name}
+        notify('@'..player.Name..' can use !stand / .stand and !unstand / .unstand')
+    end
+end
+local function handleTrustedStandMessage(player,message)
+    if not alive or not player or player==LP or player.Parent~=Players or not standWhitelist[player.UserId] then return end
+    if type(message)~='string' then return end
+    local command=message:lower():match('^%s*[!.](%a+)%s*$')
+    if command=='stand' then
+        local previous=followState
+        startFollowing(player.Name,'underground')
+        if followState and followState~=previous and followState.target==player then
+            followState.controllerUserId=player.UserId
+            notify('Stand entrance linked to @'..player.Name)
+        end
+    elseif command=='unstand' and followState and followState.controllerUserId==player.UserId then
+        stopFollowing('@'..player.Name..' released stand')
+    end
+end
+local function handleFollowCommand(message)
+    if type(message)~='string' then return end
+    local verb,argument=message:match('^%s*([./]%a+)%s*(.-)%s*$')
+    if not verb then return end
+    verb=verb:lower()
+    if verb=='.standtest' or verb=='/standtest' then
+        if argument=='' then notify('Usage: .standtest whitelisted_username'); return end
+        local player,err=findFollowTarget(argument)
+        if not player then notify(err); return end
+        if not standWhitelist[player.UserId] then notify('Whitelist this player first'); return end
+        handleTrustedStandMessage(player,'!stand')
+        return
+    end
+    if verb=='.whitelist' or verb=='/whitelist' then changeStandWhitelist(argument,false); return end
+    if verb=='.unwhitelist' or verb=='/unwhitelist' then changeStandWhitelist(argument,true); return end
+    if verb=='.comend' or verb=='/comend' then
+        if openCommandPalette then openCommandPalette() end
+        return
+    end
+    if verb=='.stand' or verb=='/stand' or verb=='.orbit' or verb=='/orbit' then
+        local mode=verb:sub(2)
+        if argument=='' and mode=='orbit' and followState then argument=followState.target.Name end
+        if argument=='' then notify('Usage: '..verb..' username (or random)'); return end
+        startFollowing(argument,mode)
+    elseif verb=='.unstand' or verb=='/unstand' or verb=='.unorbit' or verb=='/unorbit' then
+        if followState then stopFollowing('Stand disabled') else notify('Stand is not active') end
+    end
+end
+-- Compact command palette; rows are pooled so filtering creates no extra callbacks.
+do
+    local backdrop=make('TextButton',{Name='CommandShade',Text='',Size=UDim2.fromScale(1,1),BackgroundColor3=Color3.new(0,0,0),
+        BackgroundTransparency=.45,AutoButtonColor=false,Visible=false,Active=true,ZIndex=120},gui)
+    local panel=make('Frame',{Name='CommandPalette',AnchorPoint=Vector2.new(.5,.5),Position=UDim2.fromScale(.5,.5),
+        Size=UDim2.fromOffset(520,420),BackgroundColor3=C.win,Visible=false,Active=true,ZIndex=122},gui); round(panel,14); stroke(panel)
+    local sizing=make('UIScale',{},panel)
+    local titleLabel=text(panel,'Commands',UDim2.fromOffset(20,15),UDim2.fromOffset(380,32)); titleLabel.Font=Enum.Font.GothamBold; titleLabel.TextSize=18; titleLabel.TextColor3=C.text; titleLabel.ZIndex=124
+    local dismiss=make('TextButton',{Text='ESC',Position=UDim2.fromOffset(460,19),Size=UDim2.fromOffset(40,24),BackgroundColor3=C.inset,
+        TextColor3=C.label,Font=Enum.Font.Gotham,TextSize=10,ZIndex=124},panel); round(dismiss,6); stroke(dismiss)
+    local function input(placeholder,y)
+        local box=make('TextBox',{Text='',PlaceholderText=placeholder,ClearTextOnFocus=false,Position=UDim2.fromOffset(18,y),
+            Size=UDim2.fromOffset(484,36),BackgroundColor3=C.inset,TextColor3=C.text,PlaceholderColor3=C.muted,
+            Font=Enum.Font.Gotham,TextSize=12,TextXAlignment=Enum.TextXAlignment.Left,ZIndex=124},panel)
+        round(box,8); stroke(box); make('UIPadding',{PaddingLeft=UDim.new(0,12),PaddingRight=UDim.new(0,12)},box)
+        return box
+    end
+    local search=input('Search commands...',60)
+    local target=input('Target username or random',108)
+    target.UIPadding.PaddingLeft=UDim.new(0,88)
+    local targetCaption=text(panel,'TARGET',UDim2.fromOffset(30,108),UDim2.fromOffset(66,36)); targetCaption.TextSize=9; targetCaption.TextColor3=C.muted; targetCaption.ZIndex=125
+    local list=make('ScrollingFrame',{Position=UDim2.fromOffset(18,160),Size=UDim2.fromOffset(484,206),CanvasSize=UDim2.new(),
+        BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=2,ZIndex=124},panel)
+    make('UIListLayout',{Padding=UDim.new(0,6),SortOrder=Enum.SortOrder.LayoutOrder},list)
+    make('Frame',{Position=UDim2.fromOffset(18,382),Size=UDim2.fromOffset(484,1),BackgroundColor3=C.stroke,ZIndex=124},panel)
+    local hint=text(panel,'UP / DOWN  select     ENTER  run',UDim2.fromOffset(18,391),UDim2.fromOffset(360,16)); hint.TextSize=10; hint.TextColor3=C.muted; hint.ZIndex=124
+    local count=text(panel,'',UDim2.fromOffset(400,391),UDim2.fromOffset(102,16)); count.TextXAlignment=Enum.TextXAlignment.Right; count.TextSize=10; count.TextColor3=C.muted; count.ZIndex=124
+    local rows,filtered={},{}
+    local selectedIndex,lastAccent=1,nil
+    local openedAt,enterReady=0,false
+    local function close()
+        paletteOpen=false; panel.Visible=false; backdrop.Visible=false
+        if search:IsFocused() then search:ReleaseFocus() end
+        if target:IsFocused() then target:ReleaseFocus() end
+    end
+    local function targetArgument()
+        local value=target.Text:match('^%s*(.-)%s*$')
+        return value~='' and value or 'random'
+    end
+    local definitions={
+        {'Stand beside target','.stand <target>',function() handleFollowCommand('.stand '..targetArgument()) end},
+        {'Orbit target','.orbit <target>',function() handleFollowCommand('.orbit '..targetArgument()) end},
+        {'Stand beside random player','.stand random',function() handleFollowCommand('.stand random') end},
+        {'Orbit random player','.orbit random',function() handleFollowCommand('.orbit random') end},
+        {'Whitelist target','.whitelist <target>',function() handleFollowCommand('.whitelist '..targetArgument()) end},
+        {'Revoke target access','.unwhitelist <target>',function() handleFollowCommand('.unwhitelist '..targetArgument()) end},
+        {'Stop stand / orbit','.unstand',function() handleFollowCommand('.unstand') end},
+        {'Toggle flight',function() return shortKey(S.FlyKey) end,function() S.Fly=not S.Fly; refresh() end},
+        {'Toggle desync',function() return shortKey(S.DesyncKey) end,function() S.Desync=not S.Desync; refresh() end},
+        {'Open settings','Settings',function() window.Visible=true; setPage('Settings') end},
+        {'Unload script','Session',function() if unload then unload() end end},
+    }
+    local function paintSelection()
+        local chosen=filtered[selectedIndex]
+        for _,item in ipairs(rows) do
+            local active=item==chosen
+            item.button.BackgroundColor3=active and C.inset:Lerp(color(S.Accent),.12) or C.inset
+            item.border.Color=active and color(S.Accent) or C.stroke
+            item.border.Transparency=active and .15 or .5
+            item.marker.Visible=active
+            item.shortcut.Text=type(item.definition[2])=='function' and item.definition[2]() or item.definition[2]
+        end
+        local height=math.max(1,list.AbsoluteSize.Y/math.max(sizing.Scale,.01))
+        local maximum=math.max(0,#filtered*50-6-height)
+        list.CanvasPosition=Vector2.new(0,math.clamp((selectedIndex-1)*50-height/2+22,0,maximum))
+    end
+    local function executeSelected()
+        local item=filtered[selectedIndex]; if not item then return end
+        close(); item.definition[3]()
+    end
+    for index,definition in ipairs(definitions) do
+        local b=make('TextButton',{Text='',Size=UDim2.fromOffset(478,44),BackgroundColor3=C.inset,AutoButtonColor=false,
+            LayoutOrder=index,ZIndex=125},list); round(b,8)
+        local border=stroke(b)
+        local marker=make('Frame',{Position=UDim2.fromOffset(0,12),Size=UDim2.fromOffset(2,20),BackgroundColor3=color(S.Accent),ZIndex=126},b); round(marker,1); accent(marker,'BackgroundColor3')
+        local label=text(b,definition[1],UDim2.fromOffset(14,0),UDim2.fromOffset(264,44)); label.TextSize=12; label.TextColor3=C.text; label.ZIndex=126
+        local shortcut=text(b,'',UDim2.fromOffset(280,0),UDim2.fromOffset(184,44)); shortcut.TextSize=10; shortcut.TextXAlignment=Enum.TextXAlignment.Right; shortcut.ZIndex=126
+        local item={button=b,border=border,marker=marker,shortcut=shortcut,definition=definition}; rows[index]=item
+        connect(b.MouseEnter,function() selectedIndex=table.find(filtered,item) or 1; paintSelection() end)
+        connect(b.Activated,function() selectedIndex=table.find(filtered,item) or 1; executeSelected() end)
+    end
+    local empty=text(list,'No matching commands',UDim2.new(),UDim2.fromOffset(478,44)); empty.TextSize=12; empty.ZIndex=126; empty.Visible=false
+    local function filter()
+        local query=search.Text:lower():match('^%s*(.-)%s*$'); filtered={}
+        for _,item in ipairs(rows) do
+            local alias=type(item.definition[2])=='string' and item.definition[2] or ''
+            local match=(item.definition[1]..' '..alias):lower():find(query,1,true)~=nil
+            item.button.Visible=match
+            if match then table.insert(filtered,item) end
+        end
+        selectedIndex=1; empty.Visible=#filtered==0; list.CanvasSize=UDim2.fromOffset(0,math.max(44,#filtered*50-6))
+        count.Text=#filtered..' commands'; paintSelection()
+    end
+    updateCommandPalette=function()
+        if not paletteOpen then return end
+        local camera=workspace.CurrentCamera
+        if camera then
+            local v=camera.ViewportSize
+            sizing.Scale=math.max(.2,math.min(1,(v.X-32)/520,(v.Y-32)/420))
+        end
+        if lastAccent~=S.Accent then lastAccent=S.Accent; paintSelection() end
+    end
+    openCommandPalette=function()
+        closePopup(); paletteOpen=true; panel.Visible=true; backdrop.Visible=true
+        openedAt=os.clock()
+        enterReady=not (Input:IsKeyDown(Enum.KeyCode.Return) or Input:IsKeyDown(Enum.KeyCode.KeypadEnter))
+        target.Text=followState and followState.target.Name or 'random'; search.Text=''
+        filter(); updateCommandPalette()
+        task.defer(function() if alive and paletteOpen then search:CaptureFocus() end end)
+    end
+    connect(search:GetPropertyChangedSignal('Text'),filter)
+    connect(backdrop.Activated,close); connect(dismiss.Activated,close)
+    connect(Input.InputBegan,function(i)
+        if not paletteOpen then return end
+        if i.KeyCode==Enum.KeyCode.Escape then close()
+        elseif i.KeyCode==Enum.KeyCode.Return or i.KeyCode==Enum.KeyCode.KeypadEnter then
+            local focused=Input:GetFocusedTextBox()
+            if enterReady and os.clock()-openedAt>=.2 and (not focused or focused==search or focused==target) then
+                enterReady=false; executeSelected()
+            end
+        elseif Input:GetFocusedTextBox()~=target then
+            if i.KeyCode==Enum.KeyCode.Down and #filtered>0 then selectedIndex=selectedIndex%#filtered+1; paintSelection()
+            elseif i.KeyCode==Enum.KeyCode.Up and #filtered>0 then selectedIndex=(selectedIndex-2)%#filtered+1; paintSelection() end
+        end
+    end)
+    connect(Input.InputEnded,function(i)
+        if i.KeyCode==Enum.KeyCode.Return or i.KeyCode==Enum.KeyCode.KeypadEnter then enterReady=true end
+    end)
+end
+do
+    local lastMessage,lastTime='',0
+    local function dispatch(message)
+        if not alive then return end
+        if message==lastMessage and os.clock()-lastTime<.4 then return end
+        lastMessage=message; lastTime=os.clock(); handleFollowCommand(message)
+    end
+    local chat=game:GetService('TextChatService')
+    for _,name in ipairs({'stand','unstand','orbit','unorbit','comend','whitelist','unwhitelist','standtest'}) do
+        local ok,command=pcall(function()
+            return make('TextChatCommand',{Name='Veils_'..name,PrimaryAlias='.'..name,SecondaryAlias='/'..name,AutocompleteVisible=true},chat)
+        end)
+        if ok then
+            table.insert(followCommands,command)
+            connect(command.Triggered,function(source,message)
+                if source and source.UserId==LP.UserId then dispatch(message)
+                elseif source then handleTrustedStandMessage(Players:GetPlayerByUserId(source.UserId),message) end
+            end)
+        end
+    end
+    connect(LP.Chatted,dispatch)
+    local seen={}
+    local function incoming(player,message)
+        if not player or player==LP or not standWhitelist[player.UserId] or type(message)~='string' or #message>32 then return end
+        local name=message:lower():match('^%s*[!.](%a+)%s*$')
+        if name~='stand' and name~='unstand' then return end
+        local key=player.UserId..':'..message:lower()
+        local now=os.clock()
+        if seen[key] and now-seen[key]<.6 then return end
+        seen[key]=now
+        if #message<=32 then handleTrustedStandMessage(player,message) end
+        for entry,time in pairs(seen) do if now-time>3 then seen[entry]=nil end end
+    end
+    connect(chat.MessageReceived,function(message)
+        local source=message.TextSource
+        if source then incoming(Players:GetPlayerByUserId(source.UserId),message.Text) end
+    end)
+    local function watch(player)
+        if player~=LP then connect(player.Chatted,function(message) incoming(player,message) end) end
+    end
+    for _,player in ipairs(Players:GetPlayers()) do watch(player) end
+    connect(Players.PlayerAdded,watch)
+end
+local function prepareStandCharacter(root)
+    local state=followState
+    if not state then return true end
+    local character=rig(LP)
+    if not root or not character then
+        if not S.StandAutoResume then stopFollowing('Stand ended: your character unavailable'); return false end
+        if not state.waitingRespawn then
+            state.waitingRespawn=true
+            stopFlight(); notify('Stand paused - waiting for your respawn')
+        end
+        return false
+    end
+    if state.waitingRespawn or character~=state.localCharacter then
+        if not S.StandAutoResume then stopFollowing('Stand ended: your character changed'); return false end
+        state.localCharacter=character; state.waitingRespawn=false
+        state.phaseStart=os.clock(); state.lastMotionAt=-math.huge
+        notify('Stand resumed - '..state.mode..' @'..state.target.Name)
+    end
+    return true
+end
+local function updateFlight(h,r)
+    local cam=workspace.CurrentCamera
+    if followState and not S.Fly then stopFollowing(nil,false) end
+    if followState and not prepareStandCharacter(r) then stopFlight(); return end
+    if not S.Fly or not r or not cam then stopFlight(); return end
+    if not flight or flight.Parent~=r then
+        stopFlight(); flightHumanoid=h; oldAutoRotate=h.AutoRotate; oldPlatform=h.PlatformStand
+        h.AutoRotate=false; h.PlatformStand=true
+        r.AssemblyLinearVelocity=Vector3.zero; r.AssemblyAngularVelocity=Vector3.zero
+        flightAttachment=make('Attachment',{Name='VeilsFlightAttachment'},r)
+        flight=make('LinearVelocity',{Attachment0=flightAttachment,RelativeTo=Enum.ActuatorRelativeTo.World,
+            ForceLimitsEnabled=false,VelocityConstraintMode=Enum.VelocityConstraintMode.Vector,
+            MaxForce=math.huge,VectorVelocity=Vector3.zero},r)
+        flightOrientation=make('AlignOrientation',{Name='VeilsFlightOrientation',Attachment0=flightAttachment,
+            Mode=Enum.OrientationAlignmentMode.OneAttachment,RigidityEnabled=true,
+            MaxTorque=math.huge,Responsiveness=200,CFrame=r.CFrame.Rotation},r)
+    end
+    -- The movement and orientation constraints own the assembly throughout flight.
+    h.AutoRotate=false; h.PlatformStand=true
+    flightAttachment.Position=r.CFrame:PointToObjectSpace(r.AssemblyCenterOfMass)
+    if followState then
+        local goal,velocityOrError,targetMoving,entering=followGoal(followState)
+        if not goal then
+            stopFollowing(velocityOrError)
+            return
+        end
+        local delta=goal.Position-r.Position
+        if entering or delta.Magnitude>45 then
+            r.CFrame=goal; r.AssemblyLinearVelocity=Vector3.zero; r.AssemblyAngularVelocity=Vector3.zero
+            delta=Vector3.zero
+        end
+        local correction=delta*8
+        local limit=math.max(40,S.FlySpeed*1.5)
+        if correction.Magnitude>limit then correction=correction.Unit*limit end
+        flight.VectorVelocity=velocityOrError+correction
+        local facing=Vector3.new(goal.LookVector.X,0,goal.LookVector.Z)
+        if facing.Magnitude>.001 then lastFlightHeading=facing.Unit end
+        flightOrientation.CFrame=CFrame.lookAt(Vector3.zero,lastFlightHeading)
+        updateFlightAnimation(h,targetMoving)
+        return
+    end
+    local move=Vector3.zero
+    if clientFocused and not Input:GetFocusedTextBox() then
+        local function down(k) return Input:IsKeyDown(k) and 1 or 0 end
+        move=cam.CFrame.LookVector*(down(Enum.KeyCode.W)-down(Enum.KeyCode.S))
+            +cam.CFrame.RightVector*(down(Enum.KeyCode.D)-down(Enum.KeyCode.A))
+            +Vector3.yAxis*(down(Enum.KeyCode.Space)-down(Enum.KeyCode.LeftControl))
+    end
+    local moving=move.Magnitude>.01
+    flight.VectorVelocity=moving and move.Unit*S.FlySpeed or Vector3.zero
+    local heading=Vector3.new(cam.CFrame.LookVector.X,0,cam.CFrame.LookVector.Z)
+    if heading.Magnitude>.001 then lastFlightHeading=heading.Unit end
+    flightOrientation.CFrame=CFrame.lookAt(Vector3.zero,lastFlightHeading)
+    updateFlightAnimation(h,moving)
+end
+local function restoreCollision()
+    for part,value in pairs(collision) do if part.Parent then part.CanCollide=value end; collision[part]=nil end
+end
+local function stopDesync()
+    local d=desync; desync=nil
+    if not d then return end
+    if flightHumanoid==d.proxyHumanoid then stopFlight() end
+    -- Return the original character to the proxy's walked position.
+    if d.root.Parent and LP.Character==d.character and d.humanoid.Health>0 then
+        local destination=d.proxyRoot.Parent and d.proxyRoot.CFrame or d.origin
+        if destination.Position.Y<workspace.FallenPartsDestroyHeight+20 then destination=d.origin end
+        d.root.CFrame=destination
+        d.root.AssemblyLinearVelocity=Vector3.zero; d.root.AssemblyAngularVelocity=Vector3.zero
+    end
+    if d.humanoid.Parent then d.humanoid.AutoRotate=d.auto; d.humanoid.PlatformStand=d.platform end
+    for part,value in pairs(d.hidden) do if part.Parent then part.LocalTransparencyModifier=value end end
+    local camera=workspace.CurrentCamera
+    if camera and camera.CameraSubject==d.proxyHumanoid then
+        local _,h=rig(LP); camera.CameraSubject=(d.subject and d.subject.Parent and d.subject) or h
+        camera.CameraType=d.cameraType
+    end
+    if d.startMarker then d.startMarker:Destroy() end
+    d.proxy:Destroy()
+end
+local function startDesync(c,h,r)
+    stopFlight(); finishFling()
+    local archivable=c.Archivable; c.Archivable=true
+    local ok,proxy=pcall(function() return c:Clone() end); c.Archivable=archivable
+    if not ok or not proxy then S.Desync=false; refresh(); notify('Character clone failed'); return end
+    for _,x in ipairs(proxy:GetDescendants()) do
+        if x:IsA('LuaSourceContainer') or x:IsA('Tool') then x:Destroy()
+        elseif x:IsA('BasePart') then
+            x.Anchored=false; x.LocalTransparencyModifier=0
+            x.CanCollide=x.Name=='Head' or x.Name=='Torso' or x.Name=='UpperTorso' or x.Name=='LowerTorso'
+        end
+    end
+    local ph=proxy:FindFirstChildOfClass('Humanoid'); local pr=proxy:FindFirstChild('HumanoidRootPart')
+    if not ph or not pr then proxy:Destroy(); S.Desync=false; refresh(); notify('Character rig is incompatible'); return end
+    ph.PlatformStand=false; ph.AutoRotate=true; ph.DisplayDistanceType=Enum.HumanoidDisplayDistanceType.None
+    if not ph:FindFirstChildOfClass('Animator') then make('Animator',{},ph) end
+    proxy.Name='VeilsDesyncProxy'; proxy.Parent=workspace; pr.CFrame=r.CFrame
+    pr.AssemblyLinearVelocity=Vector3.zero; pr.AssemblyAngularVelocity=Vector3.zero
+    local highlight=make('Highlight',{Adornee=proxy,FillColor=color(S.DesyncColor),OutlineColor=color(S.DesyncColor),
+        FillTransparency=.7,OutlineTransparency=.05,DepthMode=Enum.HighlightDepthMode.AlwaysOnTop},proxy)
+    local aura=make('Part',{Name='DesyncAura',Shape=Enum.PartType.Ball,Size=Vector3.new(6,6,6),
+        Color=color(S.DesyncColor),Material=Enum.Material.ForceField,Transparency=.7,
+        CanCollide=false,CanTouch=false,CanQuery=false,Massless=true,CFrame=pr.CFrame},proxy)
+    make('WeldConstraint',{Part0=pr,Part1=aura},aura)
+    local startMarker=make('Part',{Name='DesyncStart',Shape=Enum.PartType.Ball,Size=Vector3.new(.6,.6,.6),
+        Anchored=true,CanCollide=false,CanTouch=false,CanQuery=false,Material=Enum.Material.Neon,
+        Color=color(S.DesyncColor),Transparency=S.DesyncMarker and .2 or 1,CFrame=r.CFrame*CFrame.new(0,-2,0)},worldVisuals)
+    local startLabel=make('BillboardGui',{Size=UDim2.fromOffset(64,18),StudsOffset=Vector3.new(0,.8,0),
+        Adornee=startMarker,AlwaysOnTop=true,MaxDistance=1500,Enabled=S.DesyncMarker},startMarker)
+    local markerText=text(startLabel,'START',UDim2.new(),UDim2.fromScale(1,1)); markerText.TextSize=10
+    markerText.TextXAlignment=Enum.TextXAlignment.Center; markerText.TextColor3=color(S.DesyncColor)
+    local trailA=make('Attachment',{Name='VeilsTrailA',Position=Vector3.new(-.25,-2,0)},pr)
+    local trailB=make('Attachment',{Name='VeilsTrailB',Position=Vector3.new(.25,-2,0)},pr)
+    local travelTrail=make('Trail',{Name='VeilsTravelTrail',Attachment0=trailA,Attachment1=trailB,
+        Lifetime=10,MaxLength=160,MinLength=.3,FaceCamera=true,WidthScale=NumberSequence.new(.35),
+        Transparency=NumberSequence.new(.25,1),Color=ColorSequence.new(color(S.DesyncColor)),Enabled=S.DesyncTrail},pr)
+    local camera=workspace.CurrentCamera
+    desync={character=c,humanoid=h,root=r,proxy=proxy,proxyRoot=pr,proxyHumanoid=ph,
+        origin=r.CFrame,auto=h.AutoRotate,platform=h.PlatformStand,hidden={},start=os.clock(),
+        subject=camera and camera.CameraSubject,cameraType=camera and camera.CameraType or Enum.CameraType.Custom,
+        highlight=highlight,aura=aura,flightCollision={},startMarker=startMarker,startLabel=startLabel,markerText=markerText,travelTrail=travelTrail}
+    h.AutoRotate=false; h.PlatformStand=true
+    notify('Desync active: V toggles by default; movement follows the local avatar')
+end
+local function updateDesync(c,h,r)
+    if not S.Desync then stopDesync(); return false end
+    if not c or not h or not r then
+        stopDesync(); S.Desync=false; refresh(); return false
+    end
+    if desync and desync.character~=c then stopDesync(); S.Desync=false; refresh(); return false end
+    if not desync then startDesync(c,h,r) end
+    local d=desync; if not d then return false end
+    if not d.proxyRoot.Parent or d.proxyHumanoid.Health<=0 then
+        stopDesync(); S.Desync=false; refresh(); return false
+    end
+    if d.proxyRoot.Position.Y<workspace.FallenPartsDestroyHeight+30 then
+        stopDesync(); S.Desync=false; refresh(); notify('Desync ended: local avatar fell out of the map'); return false
+    end
+    -- Preserve default keyboard, gamepad and touch control direction without replacing Player.Character.
+    d.proxyHumanoid.WalkSpeed=h.WalkSpeed
+    d.proxyHumanoid.UseJumpPower=h.UseJumpPower; d.proxyHumanoid.JumpPower=h.JumpPower; d.proxyHumanoid.JumpHeight=h.JumpHeight
+    if S.Fly then
+        d.proxyHumanoid:Move(Vector3.zero,false)
+        for _,part in ipairs(d.proxy:GetDescendants()) do
+            if part:IsA('BasePart') then
+                if d.flightCollision[part]==nil then d.flightCollision[part]=part.CanCollide end
+                part.CanCollide=false
+            end
+        end
+        updateFlight(d.proxyHumanoid,d.proxyRoot)
+    else
+        if flightHumanoid==d.proxyHumanoid then stopFlight() end
+        for part,value in pairs(d.flightCollision) do
+            if part.Parent then part.CanCollide=value end; d.flightCollision[part]=nil
+        end
+        d.proxyHumanoid:Move((clientFocused and not Input:GetFocusedTextBox()) and h.MoveDirection or Vector3.zero,false)
+    end
+    for _,part in ipairs(c:GetDescendants()) do
+        if part:IsA('BasePart') then
+            if d.hidden[part]==nil then d.hidden[part]=part.LocalTransparencyModifier end
+            part.LocalTransparencyModifier=1
+        end
+    end
+    local elapsed=os.clock()-d.start
+    local side=math.floor(elapsed)%2==0 and 1 or -1
+    local floor=workspace.FallenPartsDestroyHeight
+    if floor~=floor or floor==-math.huge then floor=-500 end
+    -- Stay above the engine's part-destruction plane while alternating two distant void positions once per second.
+    r.CFrame=CFrame.new(d.origin.Position.X+10000*side,floor+100,d.origin.Position.Z+10000)
+    r.AssemblyLinearVelocity=Vector3.zero; r.AssemblyAngularVelocity=Vector3.zero
+    local camera=workspace.CurrentCamera
+    if camera then camera.CameraType=Enum.CameraType.Custom; camera.CameraSubject=d.proxyHumanoid end
+    d.startMarker.Transparency=S.DesyncMarker and .2 or 1
+    d.startMarker.Color=color(S.DesyncColor); d.startLabel.Enabled=S.DesyncMarker
+    d.markerText.TextColor3=color(S.DesyncColor)
+    if d.travelTrail.Enabled~=S.DesyncTrail then d.travelTrail:Clear(); d.travelTrail.Enabled=S.DesyncTrail end
+    if d.trailColor~=S.DesyncColor then
+        d.travelTrail.Color=ColorSequence.new(color(S.DesyncColor)); d.trailColor=S.DesyncColor
+    end
+    d.highlight.FillColor=color(S.DesyncColor); d.highlight.OutlineColor=color(S.DesyncColor)
+    d.aura.Color=color(S.DesyncColor); d.aura.Transparency=.72+math.sin(elapsed*4)*.1
+    local diameter=6+math.sin(elapsed*4)*.3; d.aura.Size=Vector3.new(diameter,diameter,diameter)
+    return true
+end
+local lastJump=0
+connect(Input.JumpRequest,function()
+    if desync and S.Fly then return end
+    if desync and not Input:GetFocusedTextBox() then
+        if S.InfiniteJump and os.clock()-lastJump>=.15 then
+            lastJump=os.clock(); local h=desync.proxyHumanoid; local r=desync.proxyRoot
+            local power=h.UseJumpPower and h.JumpPower or math.sqrt(2*workspace.Gravity*h.JumpHeight)
+            r.AssemblyLinearVelocity=Vector3.new(r.AssemblyLinearVelocity.X,power,r.AssemblyLinearVelocity.Z)
+            h:ChangeState(Enum.HumanoidStateType.Jumping)
+        else desync.proxyHumanoid.Jump=true end
+        return
+    end
+    if not S.InfiniteJump or S.Fly or Input:GetFocusedTextBox() or os.clock()-lastJump<.15 then return end
+    local _,h,r=rig(LP); if not h then return end
+    lastJump=os.clock()
+    local power=h.UseJumpPower and h.JumpPower or math.sqrt(2*workspace.Gravity*h.JumpHeight)
+    r.AssemblyLinearVelocity=Vector3.new(r.AssemblyLinearVelocity.X,power,r.AssemblyLinearVelocity.Z)
+    h:ChangeState(Enum.HumanoidStateType.Jumping)
+end)
+connect(Run.Stepped,function()
+    local c=LP.Character
+    if (S.Noclip or S.Fly or S.Desync) and c then
+        for _,p in ipairs(c:GetDescendants()) do
+            if p:IsA('BasePart') then if collision[p]==nil then collision[p]=p.CanCollide end; p.CanCollide=false end
+        end
+    else restoreCollision() end
+end)
+connect(Run.Heartbeat,function()
+    local character,h,r=rig(LP)
+    for hum,original in pairs(jumps) do
+        if hum~=h or not S.JumpOverride then
+            if hum.Parent then hum.UseJumpPower=original.mode; hum.JumpHeight=original.height end
+            jumps[hum]=nil
+        end
+    end
+    if h and S.JumpOverride then
+        if not jumps[h] then jumps[h]={mode=h.UseJumpPower,height=h.JumpHeight} end
+        h.UseJumpPower=false; h.JumpHeight=S.JumpHeight
+    end
+    for humanoid,value in pairs(speeds) do
+        if humanoid~=h or not S.Speed then if humanoid.Parent then humanoid.WalkSpeed=value end; speeds[humanoid]=nil end
+    end
+    if h and S.Speed then if speeds[h]==nil then speeds[h]=h.WalkSpeed end; h.WalkSpeed=S.WalkSpeed end
+    if updateDesync(character,h,r) then return end
+    if fling then
+        if os.clock()>fling.untilTime or not fling.target.Parent or not r or r~=fling.root then finishFling()
+        else
+            r.CFrame=fling.target.CFrame*CFrame.new(math.sin(os.clock()*45)*1.5,0,math.cos(os.clock()*45)*1.5)
+            r.AssemblyAngularVelocity=Vector3.new(0,2500,0)
+            r.AssemblyLinearVelocity=Vector3.new(0,15,0)
+        end
+    end
+    updateFlight(h,r)
+end)
+local function getAimPart(p)
+    if not p or p==LP or p.Parent~=Players then return nil end
+    local c,_,root=rig(p); if not c then return nil end
+    local part=c:FindFirstChild(S.Part) or c:FindFirstChild('Head') or root
+    if part and part:IsA('BasePart') then return part end
+    return nil
+end
+local function aimVisible(part,cam)
+    local params=RaycastParams.new(); params.FilterType=Enum.RaycastFilterType.Exclude
+    local excluded=LP.Character and {LP.Character} or {}
+    if desync then table.insert(excluded,desync.proxy) end
+    params.FilterDescendantsInstances=excluded
+    local hit=workspace:Raycast(cam.CFrame.Position,part.Position-cam.CFrame.Position,params)
+    return not hit or hit.Instance:IsDescendantOf(part.Parent)
+end
+local function eligible(p,cam,center)
+    if S.TeamCheck and LP.Team~=nil and p.Team==LP.Team then return end
+    local part=getAimPart(p); if not part then return end
+    local v,visible=cam:WorldToViewportPoint(part.Position)
+    local distance=(Vector2.new(v.X,v.Y)-center).Magnitude
+    if not visible or v.Z<=0 or distance>S.FOV then return end
+    if S.WallCheck and not aimVisible(part,cam) then return end
+    return part,distance
+end
+local function selectAimTarget(cam,center)
+    -- FOV, visibility and team filtering are acquisition checks, not retarget triggers.
+    local part=locked and getAimPart(locked)
+    if part then return part end
+    locked=nil; local best=math.huge
+    for _,p in ipairs(Players:GetPlayers()) do
+        local hit,d=eligible(p,cam,center)
+        if hit and d<best then locked=p; part=hit; best=d end
+    end
+    return part
+end
+local edges={{1,2},{1,3},{1,5},{2,4},{2,6},{3,4},{3,7},{4,8},{5,6},{5,7},{6,8},{7,8}}
+local function getRecord(p)
+    if records[p] then return records[p] end
+    local folder=make('Folder',{Name='ESP_'..p.UserId},overlay)
+    local r={folder=folder,lines={},cursor=0}
+    r.fill=make('Frame',{BorderSizePixel=0,Visible=false},folder)
+    r.name=make('TextLabel',{BackgroundTransparency=1,Font=Enum.Font.GothamMedium,TextSize=12,
+        TextStrokeTransparency=.35,TextColor3=Color3.new(1,1,1),Visible=false},folder)
+    r.distance=make('TextLabel',{BackgroundTransparency=1,Font=Enum.Font.Gotham,TextSize=11,
+        TextStrokeTransparency=.35,Visible=false},folder)
+    records[p]=r; return r
+end
+local function line(r,a,b,c,thickness)
+    r.cursor=r.cursor+1
+    local f=r.lines[r.cursor]
+    if not f then f=make('Frame',{BorderSizePixel=0,AnchorPoint=Vector2.new(.5,.5),ZIndex=2},r.folder); r.lines[r.cursor]=f end
+    local d=b-a
+    f.Position=UDim2.fromOffset((a.X+b.X)/2,(a.Y+b.Y)/2)
+    f.Size=UDim2.fromOffset(d.Magnitude,thickness or 1)
+    f.Rotation=math.deg(math.atan2(d.Y,d.X)); f.BackgroundColor3=c; f.Visible=true
+end
+local function project(cam,v)
+    local p=cam:WorldToViewportPoint(v); return Vector2.new(p.X,p.Y),p.Z
+end
+local function clearRecord(r)
+    r.cursor=0; r.fill.Visible=false; r.name.Visible=false; r.distance.Visible=false
+end
+connect(Players.PlayerRemoving,function(p)
+    if followState and followState.target==p then
+        if not replaceStandTarget(followState,p) then stopFollowing('Stand ended: no replacement target available') end
+    end
+    if records[p] then records[p].folder:Destroy(); records[p]=nil end
+    if selected==p then selected=nil; targetLabel() end
+    if locked==p then locked=nil end
+end)
+startupStage='binding render callback'
+local renderName='VeilsUniverse_'..Http:GenerateGUID(false)
+Run:BindToRenderStep(renderName,Enum.RenderPriority.Camera.Value+1,function(dt)
+    if not alive then return end
+    updateMenuSnow(dt)
+    if updateCommandPalette then updateCommandPalette() end
+    local cam=workspace.CurrentCamera; if not cam then return end
+    local view=cam.ViewportSize; local center=view/2
+    scale.Scale=math.min(1,math.max(.1,(view.X-24)/980),math.max(.1,(view.Y-24)/620))
+    ring.Position=UDim2.fromOffset(center.X,center.Y); ring.Size=UDim2.fromOffset(S.FOV*2,S.FOV*2)
+    ring.Visible=S.ShowFOV; ringStroke.Color=color(S.FOVColor)
+    if S.Aim and (held or latched) and not Input:GetFocusedTextBox() then
+        local part=selectAimTarget(cam,center)
+        -- An obstructed locked target pauses tracking instead of selecting somebody else.
+        if part and (not S.WallCheck or aimVisible(part,cam)) then
+            local t=os.clock()
+            local shake=Vector3.new(math.noise(t*13,0),math.noise(0,t*13),0)*S.Shake
+            local pos=part.Position+part.AssemblyLinearVelocity*S.Prediction+shake
+            if (pos-cam.CFrame.Position).Magnitude>0.001 then
+                local alpha=S.Smooth<=0 and 1 or 1-math.exp(-dt*60/S.Smooth)
+                cam.CFrame=cam.CFrame:Lerp(CFrame.lookAt(cam.CFrame.Position,pos),alpha)
+            end
+        end
+    elseif not S.Aim or not (held or latched) then locked=nil end
+    for _,r in pairs(records) do clearRecord(r) end
+    if S.ESP then for _,p in ipairs(Players:GetPlayers()) do
+        if p~=LP and not (S.TeamCheck and LP.Team~=nil and LP.Team==p.Team) then
+            local c,humanoid,root=rig(p)
+            if c and (root.Position-cam.CFrame.Position).Magnitude<=S.MaxDistance then
+                local _,on=cam:WorldToViewportPoint(root.Position)
+                if on then
+                    local r=getRecord(p)
+                    -- Rig-only bounds avoid tools/accessories stretching the box.
+                    local low=Vector3.new(math.huge,math.huge,math.huge)
+                    local high=-low
+                    for _,part in ipairs(c:GetChildren()) do if part:IsA('BasePart') then
+                        for x=-1,1,2 do for y=-1,1,2 do for z=-1,1,2 do
+                            local v=root.CFrame:PointToObjectSpace(part.CFrame:PointToWorldSpace(part.Size*Vector3.new(x,y,z)/2))
+                            low=Vector3.new(math.min(low.X,v.X),math.min(low.Y,v.Y),math.min(low.Z,v.Z))
+                            high=Vector3.new(math.max(high.X,v.X),math.max(high.Y,v.Y),math.max(high.Z,v.Z))
+                        end end end
+                    end end
+                    local corners={}; local min=Vector2.new(math.huge,math.huge); local max=-min; local inFront=true
+                    for x=0,1 do for y=0,1 do for z=0,1 do
+                        local world=root.CFrame:PointToWorldSpace(Vector3.new(x==0 and low.X or high.X,y==0 and low.Y or high.Y,z==0 and low.Z or high.Z))
+                        local v,depth=project(cam,world); table.insert(corners,v); if depth<=.1 then inFront=false end
+                        min=Vector2.new(math.min(min.X,v.X),math.min(min.Y,v.Y)); max=Vector2.new(math.max(max.X,v.X),math.max(max.Y,v.Y))
+                    end end end
+                    if inFront then
+                        local a,b,d,e=min,Vector2.new(max.X,min.Y),max,Vector2.new(min.X,max.Y)
+                        if S.Fill then r.fill.Visible=true; r.fill.Position=UDim2.fromOffset(min.X,min.Y); r.fill.Size=UDim2.fromOffset(max.X-min.X,max.Y-min.Y)
+                            r.fill.BackgroundColor3=color(S.FillColor); r.fill.BackgroundTransparency=1-S.FillOpacity end
+                        if S.Box then local col=color(S.BoxColor); line(r,a,b,col); line(r,b,d,col); line(r,d,e,col); line(r,e,a,col) end
+                        if S.Box3D then for _,edge in ipairs(edges) do line(r,corners[edge[1]],corners[edge[2]],color(S.Box3DColor)) end end
+                        if S.Names then r.name.Visible=true; r.name.Text=p.DisplayName..' (@'..p.Name..')'; r.name.TextColor3=color(S.NameColor)
+                            r.name.Position=UDim2.fromOffset((min.X+max.X)/2-150,min.Y-21); r.name.Size=UDim2.fromOffset(300,18) end
+                        if S.Distance then r.distance.Visible=true; r.distance.Text=string.format('%d studs',(root.Position-cam.CFrame.Position).Magnitude)
+                            r.distance.TextColor3=color(S.DistanceColor); r.distance.Position=UDim2.fromOffset((min.X+max.X)/2-75,max.Y+3); r.distance.Size=UDim2.fromOffset(150,16) end
+                        if S.HealthBar then
+                            local fraction=math.clamp(humanoid.Health/math.max(humanoid.MaxHealth,1),0,1)
+                            line(r,Vector2.new(min.X-5,min.Y),Vector2.new(min.X-5,max.Y),Color3.fromRGB(20,20,20),4)
+                            line(r,Vector2.new(min.X-5,max.Y),Vector2.new(min.X-5,max.Y-(max.Y-min.Y)*fraction),color(S.HealthColor),2)
+                        end
+                        local foot=Vector2.new((min.X+max.X)/2,max.Y)
+                        if S.Tracers then line(r,Vector2.new(center.X,view.Y),foot,color(S.TracerColor)) end
+                        if S.Snaplines then local v=project(cam,root.Position); line(r,center,v,color(S.SnapColor)) end
+                        if S.Skeleton then for _,joint in ipairs(c:GetDescendants()) do
+                            if joint:IsA('Motor6D') and joint.Part0 and joint.Part1 and joint.Part0.Parent==c and joint.Part1.Parent==c then
+                                local v1,z1=project(cam,joint.Part0.Position); local v2,z2=project(cam,joint.Part1.Position)
+                                if z1>.1 and z2>.1 then line(r,v1,v2,color(S.SkeletonColor),1.5) end
+                            end
+                        end end
+                    end
+                end
+            end
+        end
+    end end
+    updateCompactOverlays()
+    for _,r in pairs(records) do for i=r.cursor+1,#r.lines do r.lines[i].Visible=false end end
+end)
+unload=function()
+    if not alive then return end; alive=false
+    Run:UnbindFromRenderStep(renderName)
+    for _,c in ipairs(connections) do c:Disconnect() end
+    stopFollowing(nil,false)
+    for _,command in ipairs(followCommands) do command:Destroy() end
+    finishFling(); stopFlight(); stopDesync(); restoreCollision(); restoreWorld()
+    for h,v in pairs(speeds) do if h.Parent then h.WalkSpeed=v end end
+    for h,v in pairs(jumps) do if h.Parent then h.UseJumpPower=v.mode; h.JumpHeight=v.height end end
+    worldVisuals:Destroy(); gui:Destroy(); env.VeilsUniverse=nil
+end
+startupStage='refreshing controls'
+env.VeilsUniverse={Unload=unload,Settings=S}
+refresh()
+window.Visible=true
+local camera=workspace.CurrentCamera
+if camera and camera.ViewportSize.X>0 and camera.ViewportSize.Y>0 then
+    local view=camera.ViewportSize
+    scale.Scale=math.max(.1,math.min(1,(view.X-24)/980,(view.Y-24)/620))
+end
+local reopen=make('TextButton',{Name='OpenVeils',Text='V',Position=UDim2.fromOffset(16,14),Size=UDim2.fromOffset(32,32),
+    BackgroundColor3=C.card,TextColor3=color(S.Accent),TextSize=18,Font=Enum.Font.GothamBold,ZIndex=100},gui)
+round(reopen,9); stroke(reopen); accent(reopen,'TextColor3')
+connect(reopen.Activated,function()
+    window.Visible=not window.Visible
+    if window.Visible then window.Position=UDim2.fromScale(.5,.5) end
+end)
+startupStage='ready'
+notify('Veils Universe - studio layout loaded')
+
+end
+-- Temporary local key gate. Replace this check with server validation for distribution.
+local function awaitVeilsKey()
+    local expectedKey='123'
+    local Tween=game:GetService('TweenService')
+    local previous=startupEnvironment.VeilsKeyClose
+    if type(previous)=='function' then pcall(previous) end
+    local root=Instance.new('ScreenGui')
+    root.Name='VeilsKeyGate'; root.IgnoreGuiInset=true; root.ResetOnSpawn=false
+    root.DisplayOrder=9999; root.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+    mountVeilsGui(root)
+    local connections={}
+    local completed=Instance.new('BindableEvent')
+    local finished,busy=false,false
+    local accepted=false
+    local pink=Color3.fromRGB(255,114,182)
+    local function make(class,props,parent)
+        local item=Instance.new(class)
+        for key,value in pairs(props) do item[key]=value end
+        item.Parent=parent; return item
+    end
+    local function connect(signal,fn) connections[#connections+1]=signal:Connect(fn) end
+    local function corner(item,r) make('UICorner',{CornerRadius=UDim.new(0,r)},item) end
+    local function tween(item,props,duration)
+        local animation=Tween:Create(item,TweenInfo.new(duration or .2,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),props)
+        animation:Play(); return animation
+    end
+    local function label(parent,value,x,y,w,h,size,col)
+        return make('TextLabel',{BackgroundTransparency=1,Text=value,Position=UDim2.fromOffset(x,y),
+            Size=UDim2.fromOffset(w,h),Font=Enum.Font.GothamMedium,TextSize=size,TextColor3=col or Color3.fromRGB(242,239,246),
+            TextXAlignment=Enum.TextXAlignment.Left,ZIndex=3},parent)
+    end
+    local shade=make('Frame',{Size=UDim2.fromScale(1,1),BackgroundColor3=Color3.fromRGB(5,5,9),BackgroundTransparency=.25,BorderSizePixel=0},root)
+    local card=make('Frame',{AnchorPoint=Vector2.new(.5,.5),Position=UDim2.fromScale(.5,.53),Size=UDim2.fromOffset(420,306),
+        BackgroundColor3=Color3.fromRGB(15,14,20),BorderSizePixel=0,ClipsDescendants=true,ZIndex=2},shade); corner(card,16)
+    local border=make('UIStroke',{Color=Color3.fromRGB(54,44,59),Thickness=1},card)
+    local sizing=make('UIScale',{Scale=1},card)
+    local function resize()
+        local camera=workspace.CurrentCamera
+        if camera then sizing.Scale=math.min(1,math.max(.1,math.min((camera.ViewportSize.X-32)/420,(camera.ViewportSize.Y-32)/306))) end
+    end
+    resize()
+    connect(shade:GetPropertyChangedSignal('AbsoluteSize'),resize)
+    local rail=make('Frame',{Position=UDim2.fromOffset(0,0),Size=UDim2.new(1,0,0,2),BackgroundColor3=pink,BorderSizePixel=0,ZIndex=3},card)
+    make('UIGradient',{Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,1),NumberSequenceKeypoint.new(.5,0),NumberSequenceKeypoint.new(1,1)})},rail)
+    local monogram=label(card,'V',26,24,40,40,28,pink);monogram.Font=Enum.Font.GothamBold
+    local wordmark=label(card,'VEILS UNIVERSE',76,28,270,20,13); wordmark.Font=Enum.Font.GothamBold
+    label(card,'ACCESS PORTAL',76,49,260,16,9,Color3.fromRGB(126,118,140))
+    label(card,'Enter your key to open your universe.',26,82,368,22,12,Color3.fromRGB(157,150,168))
+    label(card,'ACCESS KEY',26,125,300,16,10,Color3.fromRGB(176,164,185))
+    local input=make('TextBox',{Text='',PlaceholderText='Enter key',PlaceholderColor3=Color3.fromRGB(122,114,135),ClearTextOnFocus=false,MultiLine=false,
+        Position=UDim2.fromOffset(26,150),Size=UDim2.fromOffset(368,46),BackgroundColor3=Color3.fromRGB(22,20,28),
+        TextColor3=Color3.new(1,1,1),TextTransparency=0,Font=Enum.Font.Gotham,TextSize=16,TextXAlignment=Enum.TextXAlignment.Left,
+        BorderSizePixel=0,ZIndex=3},card);corner(input,8)
+    make('UIPadding',{PaddingLeft=UDim.new(0,14),PaddingRight=UDim.new(0,14)},input)
+    local inputBorder=make('UIStroke',{Color=Color3.fromRGB(48,42,56),Thickness=1},input)
+    local status=label(card,'',26,200,368,20,11,Color3.fromRGB(255,139,160))
+    local unlock=make('TextButton',{Text='Unlock universe',Position=UDim2.fromOffset(26,229),Size=UDim2.fromOffset(368,43),
+        BackgroundColor3=pink,TextColor3=Color3.fromRGB(32,13,26),AutoButtonColor=false,Font=Enum.Font.GothamBold,TextSize=13,BorderSizePixel=0,ZIndex=3},card);corner(unlock,8)
+    local close=make('TextButton',{Text='x',Position=UDim2.fromOffset(367,20),Size=UDim2.fromOffset(28,28),
+        BackgroundTransparency=1,TextColor3=Color3.fromRGB(151,139,165),Font=Enum.Font.Gotham,TextSize=22,ZIndex=4},card)
+    local function finish(ok)
+        if finished then return end
+        finished=true; accepted=ok
+        completed:Fire()
+    end
+    local cancel=function() finish(false) end
+    startupEnvironment.VeilsKeyClose=cancel
+    connect(input:GetPropertyChangedSignal('Text'),function() status.Text='' end)
+    connect(input.Focused,function() tween(inputBorder,{Color=pink}) end)
+    connect(input.FocusLost,function(enter) tween(inputBorder,{Color=Color3.fromRGB(48,42,56)}) end)
+    local function submit()
+        if busy or finished then return end
+        local value=input.Text:match('^%s*(.-)%s*$')
+        if value~=expectedKey then
+            status.Text="That key does not match. Try again."
+            tween(inputBorder,{Color=Color3.fromRGB(255,104,137)})
+            task.spawn(function()
+                for _,x in ipairs({-5,5,-3,3,0}) do
+                    if finished then return end
+                    tween(input,{Position=UDim2.fromOffset(26+x,150)},.04); task.wait(.04)
+                end
+            end)
+            return
+        end
+        busy=true; input.TextEditable=false
+        unlock.Text='Access granted';tween(unlock,{BackgroundColor3=Color3.fromRGB(134,228,177)})
+        status.Text='Welcome to Veils Universe.';status.TextColor3=Color3.fromRGB(134,228,177)
+        tween(border,{Color=Color3.fromRGB(134,228,177)})
+        task.delay(.45,function() finish(true) end)
+    end
+    connect(unlock.Activated,submit)
+    -- Enter uses the same validation path as the button.
+    connect(input.FocusLost,function(enter) if enter then submit() end end)
+    connect(unlock.MouseEnter,function() if not busy then tween(unlock,{BackgroundColor3=Color3.fromRGB(255,145,198)}) end end)
+    connect(unlock.MouseLeave,function() if not busy then tween(unlock,{BackgroundColor3=pink}) end end)
+    connect(close.Activated,cancel)
+    connect(root.Destroying,function() finish(false) end)
+    tween(card,{Position=UDim2.fromScale(.5,.5)},.3)
+    completed.Event:Wait()
+    for _,connection in ipairs(connections) do connection:Disconnect() end
+    if startupEnvironment.VeilsKeyClose==cancel then startupEnvironment.VeilsKeyClose=nil end
+    root:Destroy();completed:Destroy()
+    return accepted
+end
+if not awaitVeilsKey() then return end
+
+local startupOK,startupError=xpcall(bootVeils,function(err)
+    return debug.traceback(tostring(err),2)
+end)
+if startupOK then
+    startupEnvironment.VeilsLastError=nil
+    if startupOverlay then startupOverlay:Destroy(); startupOverlay=nil end
+    print('[Veils Universe] Menu ready')
+else
+    local message='Veils startup failed at '..startupStage..':\n'..tostring(startupError)
+    startupEnvironment.VeilsLastError=message
+    warn(message)
+    local instance=startupEnvironment.VeilsUniverse
+    if type(instance)=='table' and type(instance.Unload)=='function' then pcall(instance.Unload) end
+    pcall(showStartupStatus,message,true)
+end
